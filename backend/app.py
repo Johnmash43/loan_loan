@@ -1,0 +1,1337 @@
+import hmac
+import hashlib
+import io
+import json
+import os
+import re
+import sqlite3
+import tempfile
+import uuid
+import zipfile
+from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from functools import wraps
+from pathlib import Path
+
+import requests
+from flask import Flask, g, jsonify, request, send_file, send_from_directory, session
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils.exceptions import InvalidFileException
+from werkzeug.security import check_password_hash, generate_password_hash
+
+
+ROOT = Path(__file__).resolve().parent.parent
+DATABASE = Path(os.environ.get("DATABASE_PATH", ROOT / "data" / "loans.sqlite3"))
+EXCEL_LEDGER = Path(os.environ.get("EXCEL_LEDGER_PATH", ROOT / "data" / "loan_ledger.xlsx"))
+FORMS_DIRECTORY = Path(os.environ.get("FORMS_DIRECTORY", ROOT / "data" / "forms"))
+CLIENT_LEDGER_DIRECTORY = Path(
+    os.environ.get("CLIENT_LEDGER_DIRECTORY", Path.home() / "MASH" / "LEDGERS")
+)
+PAYBILL = os.environ.get("MPESA_PAYBILL", "")
+CALLBACK_TOKEN = os.environ.get("MPESA_CALLBACK_TOKEN", "")
+STAFF_USERNAME = os.environ.get("STAFF_USERNAME", "admin")
+STAFF_PASSWORD = os.environ.get("STAFF_PASSWORD", "admin123")
+WEBHOOK_URL = os.environ.get("NOTIFICATION_WEBHOOK_URL", "")
+WEBHOOK_TOKEN = os.environ.get("NOTIFICATION_WEBHOOK_TOKEN", "")
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "local-development-key-change-me")
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Strict",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "false").lower() == "true",
+    MAX_CONTENT_LENGTH=10 * 1024 * 1024,
+)
+
+if os.environ.get("APP_ENV") == "production":
+    if app.secret_key == "local-development-key-change-me" or STAFF_PASSWORD == "admin123":
+        raise RuntimeError("Set FLASK_SECRET_KEY and STAFF_PASSWORD before production startup.")
+    if not PAYBILL or not CALLBACK_TOKEN:
+        raise RuntimeError("Set MPESA_PAYBILL and MPESA_CALLBACK_TOKEN before production startup.")
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS clients (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    phone TEXT NOT NULL,
+    national_id TEXT NOT NULL UNIQUE,
+    business_type TEXT NOT NULL,
+    business_location TEXT NOT NULL,
+    residence_location TEXT NOT NULL,
+    guarantor_name TEXT NOT NULL,
+    guarantor_phone TEXT NOT NULL DEFAULT '',
+    guarantor_national_id TEXT NOT NULL,
+    guarantor_business_type TEXT NOT NULL,
+    guarantor_business_location TEXT NOT NULL,
+    guarantor_residence_location TEXT NOT NULL,
+    form_filename TEXT NOT NULL DEFAULT '',
+    form_original_name TEXT NOT NULL DEFAULT '',
+    account_status TEXT NOT NULL DEFAULT 'active' CHECK(account_status IN ('active', 'paused')),
+    account_note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS loans (
+    id INTEGER PRIMARY KEY,
+    client_id INTEGER NOT NULL REFERENCES clients(id),
+    principal_cents INTEGER NOT NULL CHECK(principal_cents > 0),
+    interest_rate REAL NOT NULL CHECK(interest_rate >= 0),
+    interest_cents INTEGER NOT NULL CHECK(interest_cents >= 0),
+    total_due_cents INTEGER NOT NULL CHECK(total_due_cents > 0),
+    term_days INTEGER NOT NULL CHECK(term_days BETWEEN 25 AND 30),
+    issued_on TEXT NOT NULL,
+    due_on TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'settled')),
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS payments (
+    id INTEGER PRIMARY KEY,
+    loan_id INTEGER NOT NULL REFERENCES loans(id),
+    transaction_id TEXT NOT NULL UNIQUE,
+    amount_cents INTEGER NOT NULL CHECK(amount_cents > 0),
+    phone TEXT NOT NULL DEFAULT '',
+    paid_at TEXT NOT NULL,
+    raw_payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY,
+    client_id INTEGER NOT NULL REFERENCES clients(id),
+    loan_id INTEGER REFERENCES loans(id),
+    kind TEXT NOT NULL,
+    message TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'sent', 'failed')),
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    sent_at TEXT,
+    UNIQUE(loan_id, kind)
+);
+CREATE TABLE IF NOT EXISTS staff_users (
+    id INTEGER PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    full_name TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('admin', 'staff')),
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
+    created_at TEXT NOT NULL
+);
+"""
+
+
+def connect_db():
+    DATABASE.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DATABASE)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def get_db():
+    if "db" not in g:
+        g.db = connect_db()
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(_error=None):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+
+def initialize_database():
+    with connect_db() as db:
+        db.executescript(SCHEMA)
+        client_columns = {
+            row["name"] for row in db.execute("PRAGMA table_info(clients)").fetchall()
+        }
+        if "guarantor_phone" not in client_columns:
+            db.execute("ALTER TABLE clients ADD COLUMN guarantor_phone TEXT NOT NULL DEFAULT ''")
+        if "form_filename" not in client_columns:
+            db.execute("ALTER TABLE clients ADD COLUMN form_filename TEXT NOT NULL DEFAULT ''")
+        if "form_original_name" not in client_columns:
+            db.execute("ALTER TABLE clients ADD COLUMN form_original_name TEXT NOT NULL DEFAULT ''")
+        db.execute(
+            """INSERT OR IGNORE INTO staff_users
+               (username, full_name, password_hash, role, created_at)
+               VALUES (?, 'Administrator', ?, 'admin', ?)""",
+            (
+                STAFF_USERNAME,
+                generate_password_hash(STAFF_PASSWORD),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+
+initialize_database()
+
+
+def error(message, status=400):
+    return jsonify({"error": message}), status
+
+
+def staff_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        user_id = session.get("user_id")
+        if not user_id:
+            return error("Staff login required.", 401)
+        user = get_db().execute(
+            "SELECT id, username, full_name, role, active FROM staff_users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        if user is None or not user["active"]:
+            session.clear()
+            return error("Staff login required.", 401)
+        g.staff_user = user
+        return view(*args, **kwargs)
+
+    return wrapped
+
+
+def admin_required(view):
+    @wraps(view)
+    @staff_required
+    def wrapped(*args, **kwargs):
+        if g.staff_user["role"] != "admin":
+            return error("Administrator access required.", 403)
+        return view(*args, **kwargs)
+
+    return wrapped
+
+
+def money_to_cents(value):
+    try:
+        amount = Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        raise ValueError("Enter a valid monetary amount.")
+    if not amount.is_finite() or amount <= 0:
+        raise ValueError("Amount must be greater than zero.")
+    return int(amount * 100)
+
+
+def format_money(cents):
+    return f"{cents / 100:.2f}"
+
+
+def client_row(row):
+    return dict(row)
+
+
+def loan_row(db, loan):
+    data = dict(loan)
+    paid = db.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) FROM payments WHERE loan_id = ?",
+        (loan["id"],),
+    ).fetchone()[0]
+    principal_paid = allocated_principal_cents(
+        loan["principal_cents"], loan["total_due_cents"], paid
+    )
+    data.update(
+        principal=format_money(loan["principal_cents"]),
+        interest=format_money(loan["interest_cents"]),
+        total_due=format_money(loan["total_due_cents"]),
+        paid=format_money(paid),
+        balance=format_money(max(0, loan["total_due_cents"] - paid)),
+        principal_paid=format_money(principal_paid),
+        interest_earned=format_money(max(0, paid - principal_paid)),
+        principal_balance=format_money(max(0, loan["principal_cents"] - principal_paid)),
+        daily_installment=format_money(
+            (Decimal(loan["total_due_cents"]) / loan["term_days"]).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+        ),
+    )
+    return data
+
+
+def allocated_principal_cents(principal_cents, total_due_cents, cumulative_paid_cents):
+    paid_toward_total = min(max(cumulative_paid_cents, 0), total_due_cents)
+    return min(
+        principal_cents,
+        (paid_toward_total * principal_cents + total_due_cents // 2) // total_due_cents,
+    )
+
+
+def deliver_notification(notification_id):
+    db = connect_db()
+    try:
+        row = db.execute(
+            """SELECT n.*, c.phone FROM notifications n
+               JOIN clients c ON c.id = n.client_id WHERE n.id = ?""",
+            (notification_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"Notification {notification_id} was not found.")
+
+        if not WEBHOOK_URL:
+            db.execute(
+                "UPDATE notifications SET status = 'pending', error = ? WHERE id = ?",
+                ("No notification webhook is configured.", notification_id),
+            )
+            db.commit()
+            return
+
+        headers = {"Content-Type": "application/json"}
+        if WEBHOOK_TOKEN:
+            headers["Authorization"] = f"Bearer {WEBHOOK_TOKEN}"
+        try:
+            response = requests.post(
+                WEBHOOK_URL,
+                json={"to": row["phone"], "message": row["message"]},
+                headers=headers,
+                timeout=10,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            db.execute(
+                "UPDATE notifications SET status = 'failed', error = ? WHERE id = ?",
+                (str(exc)[:500], notification_id),
+            )
+            db.commit()
+            return
+
+        db.execute(
+            "UPDATE notifications SET status = 'sent', error = '', sent_at = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), notification_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def queue_notification(db, client_id, loan_id, kind, message):
+    cursor = db.execute(
+        """INSERT OR IGNORE INTO notifications (client_id, loan_id, kind, message, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (client_id, loan_id, kind, message, datetime.now(timezone.utc).isoformat()),
+    )
+    if cursor.rowcount:
+        notification_id = cursor.lastrowid
+        db.commit()
+        deliver_notification(notification_id)
+        return notification_id
+    return None
+
+
+def required_text(payload, key, label):
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} is required.")
+    return value.strip()
+
+
+def parse_payment_time(value):
+    if not value:
+        return datetime.now().replace(microsecond=0)
+    text = str(value).strip()
+    try:
+        parsed = datetime.strptime(text, "%Y%m%d%H%M%S")
+    except ValueError:
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("Payment timestamp must be ISO format or M-Pesa YYYYMMDDHHMMSS.") from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed.replace(microsecond=0)
+
+
+def append_spreadsheet_row(sheet, values):
+    sheet.append(values)
+    for cell, value in zip(sheet[sheet.max_row], values):
+        if isinstance(value, str) and value.startswith(("=", "+", "-", "@", "\t", "\r")):
+            cell.data_type = "s"
+
+
+def export_excel_ledger():
+    db = connect_db()
+    workbook = Workbook()
+    clients_sheet = workbook.active
+    clients_sheet.title = "Client Accounts"
+    payments_sheet = workbook.create_sheet("Payment History")
+    clients_sheet.append(
+        [
+            "Client Name", "Client Phone", "Client National ID", "Business Type",
+            "Business Location", "Residence Location", "Guarantor Name", "Guarantor Phone",
+            "Guarantor National ID", "Guarantor Business Type", "Guarantor Business Location",
+            "Guarantor Residence Location", "Word Form", "Account Status", "Loan ID",
+            "Principal (KES)", "Interest (KES)", "Original Total Issued (KES)",
+            "Total Amount Paid (KES)", "Remaining Balance (KES)", "Term (Days)",
+            "Issue Date", "Due Date", "Loan Status",
+        ]
+    )
+    payments_sheet.append(
+        [
+            "Transaction ID", "Client Name", "Client National ID", "Client Phone",
+            "Loan ID", "Principal (KES)", "Interest (KES)", "Original Total Issued (KES)",
+            "Amount Paid (KES)", "Principal Repaid (KES)", "Interest Earned (KES)",
+            "Cumulative Amount Paid (KES)", "Remaining Principal (KES)", "Total Balance (KES)",
+            "Day", "Date", "Month", "Year", "Time",
+        ]
+    )
+    try:
+        clients = db.execute(
+            """SELECT c.*, l.id AS loan_id, l.principal_cents, l.interest_cents,
+                      l.total_due_cents, l.term_days, l.issued_on, l.due_on, l.status AS loan_status,
+                      COALESCE(p.total_paid, 0) AS total_paid
+               FROM clients c
+               LEFT JOIN loans l ON l.client_id = c.id
+               LEFT JOIN (
+                   SELECT loan_id, SUM(amount_cents) AS total_paid
+                   FROM payments GROUP BY loan_id
+               ) p ON p.loan_id = l.id
+               ORDER BY c.id, l.id"""
+        ).fetchall()
+        for row in clients:
+            has_loan = row["loan_id"] is not None
+            values = [
+                row["name"], row["phone"], row["national_id"], row["business_type"],
+                row["business_location"], row["residence_location"], row["guarantor_name"],
+                row["guarantor_phone"], row["guarantor_national_id"],
+                row["guarantor_business_type"], row["guarantor_business_location"],
+                row["guarantor_residence_location"], row["form_original_name"],
+                row["account_status"], row["loan_id"],
+                row["principal_cents"] / 100 if has_loan else None,
+                row["interest_cents"] / 100 if has_loan else None,
+                row["total_due_cents"] / 100 if has_loan else None,
+                row["total_paid"] / 100 if has_loan else None,
+                max(0, row["total_due_cents"] - row["total_paid"]) / 100 if has_loan else None,
+                row["term_days"], row["issued_on"], row["due_on"], row["loan_status"],
+            ]
+            append_spreadsheet_row(clients_sheet, values)
+            if row["form_filename"]:
+                form_cell = clients_sheet.cell(row=clients_sheet.max_row, column=13)
+                form_cell.hyperlink = f"forms/{row['form_filename']}"
+                form_cell.style = "Hyperlink"
+
+        payment_rows = db.execute(
+            """SELECT p.*, l.id AS loan_id, l.principal_cents, l.interest_cents,
+                      l.total_due_cents, c.name AS client_name, c.national_id, c.phone
+               FROM payments p
+               JOIN loans l ON l.id = p.loan_id
+               JOIN clients c ON c.id = l.client_id
+               ORDER BY p.id"""
+        ).fetchall()
+        cumulative = {}
+        for row in payment_rows:
+            paid_at = parse_payment_time(row["paid_at"])
+            previous_paid = cumulative.get(row["loan_id"], 0)
+            cumulative[row["loan_id"]] = previous_paid + row["amount_cents"]
+            principal_paid = (
+                allocated_principal_cents(
+                    row["principal_cents"], row["total_due_cents"], cumulative[row["loan_id"]]
+                )
+                - allocated_principal_cents(
+                    row["principal_cents"], row["total_due_cents"], previous_paid
+                )
+            )
+            values = [
+                row["transaction_id"], row["client_name"], row["national_id"], row["phone"],
+                row["loan_id"], row["principal_cents"] / 100, row["interest_cents"] / 100,
+                row["total_due_cents"] / 100, row["amount_cents"] / 100,
+                principal_paid / 100, (row["amount_cents"] - principal_paid) / 100,
+                cumulative[row["loan_id"]] / 100,
+                max(0, row["principal_cents"] - allocated_principal_cents(
+                    row["principal_cents"], row["total_due_cents"], cumulative[row["loan_id"]]
+                )) / 100,
+                max(0, row["total_due_cents"] - cumulative[row["loan_id"]]) / 100,
+                paid_at.strftime("%A"), paid_at.date(), paid_at.strftime("%B"),
+                paid_at.year, paid_at.time(),
+            ]
+            append_spreadsheet_row(payments_sheet, values)
+
+        for sheet in workbook.worksheets:
+            sheet.freeze_panes = "A2"
+            sheet.auto_filter.ref = sheet.dimensions
+            for cell in sheet[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="ED8240")
+                cell.alignment = Alignment(wrap_text=True, vertical="center")
+            sheet.row_dimensions[1].height = 32
+            for column in sheet.columns:
+                letter = column[0].column_letter
+                width = min(max(max(len(str(cell.value or "")) for cell in column) + 2, 12), 34)
+                sheet.column_dimensions[letter].width = width
+        for row in payments_sheet.iter_rows(min_row=2):
+            row[15].number_format = "yyyy-mm-dd"
+            row[18].number_format = "hh:mm:ss"
+            for cell in row[5:15]:
+                cell.number_format = '#,##0.00'
+        for row in clients_sheet.iter_rows(min_row=2):
+            for cell in row[15:20]:
+                cell.number_format = '#,##0.00'
+
+        EXCEL_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            suffix=".xlsx", dir=EXCEL_LEDGER.parent, delete=False
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+        workbook.save(temporary_path)
+        os.replace(temporary_path, EXCEL_LEDGER)
+    except Exception:
+        if "temporary_path" in locals():
+            temporary_path.unlink(missing_ok=True)
+        raise
+    finally:
+        db.close()
+
+
+def client_ledger_files():
+    if not CLIENT_LEDGER_DIRECTORY.is_dir():
+        raise FileNotFoundError(f"Client ledger directory not found: {CLIENT_LEDGER_DIRECTORY}")
+    root = CLIENT_LEDGER_DIRECTORY.resolve()
+    files = []
+    for path in CLIENT_LEDGER_DIRECTORY.rglob("*"):
+        if (
+            not path.is_file()
+            or path.is_symlink()
+            or path.suffix.lower() != ".xlsx"
+            or path.name.startswith(("~$", "."))
+        ):
+            continue
+        resolved = path.resolve()
+        if not resolved.is_relative_to(root):
+            continue
+        relative_path = path.relative_to(CLIENT_LEDGER_DIRECTORY).as_posix()
+        ledger_id = hashlib.sha256(relative_path.encode("utf-8")).hexdigest()[:24]
+        location = (
+            ""
+            if path.parent == CLIENT_LEDGER_DIRECTORY
+            else path.parent.relative_to(CLIENT_LEDGER_DIRECTORY).as_posix()
+        )
+        files.append(
+            {
+                "id": ledger_id,
+                "name": path.stem.strip(),
+                "location": location,
+                "relative_path": relative_path,
+            }
+        )
+    return sorted(files, key=lambda item: (item["name"].casefold(), item["location"].casefold()))
+
+
+def visible_client_ledger_files():
+    client_names = get_db().execute("SELECT name FROM clients").fetchall()
+    registered_names = {
+        re.sub(r"[^a-z0-9]", "", row["name"].casefold()) for row in client_names
+    }
+    return [
+        item
+        for item in client_ledger_files()
+        if re.sub(r"[^a-z0-9]", "", item["name"].casefold()) in registered_names
+    ]
+
+
+def ledger_cell_value(value):
+    if isinstance(value, datetime):
+        return value.strftime("%d/%m/%Y")
+    if isinstance(value, (date, time)):
+        return value.isoformat()
+    return value
+
+
+@app.get("/api/client-ledgers")
+@staff_required
+def list_client_ledgers():
+    try:
+        files = visible_client_ledger_files()
+    except OSError as exc:
+        app.logger.exception("Client ledger directory could not be read")
+        return error(f"Could not read the client ledger directory: {exc}", 500)
+    return jsonify(
+        [
+            {key: value for key, value in item.items() if key != "relative_path"}
+            for item in files
+        ]
+    )
+
+
+@app.get("/api/client-ledgers/<ledger_id>")
+@staff_required
+def read_client_ledger(ledger_id):
+    try:
+        ledger = next(
+            (item for item in visible_client_ledger_files() if item["id"] == ledger_id),
+            None,
+        )
+        if ledger is None:
+            return error("Client ledger not found.", 404)
+
+        workbook = load_workbook(
+            CLIENT_LEDGER_DIRECTORY / ledger["relative_path"],
+            data_only=True,
+            read_only=True,
+        )
+        try:
+            sheets = []
+            for worksheet in workbook.worksheets:
+                sheet_rows = []
+                header_row_index = None
+                metadata = []
+                for row_index, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
+                    values = [ledger_cell_value(value) for value in row]
+                    while values and values[-1] is None:
+                        values.pop()
+                    if not values:
+                        continue
+                    if row_index <= 3:
+                        for index in range(0, len(values) - 1, 2):
+                            label, value = values[index], values[index + 1]
+                            if label is not None and value is not None:
+                                if isinstance(value, str):
+                                    value = value.strip().lstrip(";").strip()
+                                metadata.append({"label": str(label).strip().rstrip(";"), "value": value})
+                        for value in values:
+                            if isinstance(value, str) and value.upper().startswith("ID;"):
+                                metadata.append({"label": "ID", "value": value.split(";", 1)[1].strip()})
+                    if header_row_index is None and {
+                        str(value).strip().upper() for value in values if value is not None
+                    }.issuperset({"DATE", "DETAILS"}):
+                        header_row_index = row_index
+                        headers = values
+                        continue
+                    if header_row_index is not None and row_index > header_row_index:
+                        sheet_rows.append(values)
+                if header_row_index is not None:
+                    column_count = max(
+                        len(headers),
+                        max((len(row) for row in sheet_rows), default=0),
+                    )
+                    headers = [
+                        str(headers[index]).strip()
+                        if index < len(headers) and headers[index] is not None
+                        else f"Column {index + 1}"
+                        for index in range(column_count)
+                    ]
+                    normalized_rows = [
+                        row + [None] * (column_count - len(row)) for row in sheet_rows
+                    ]
+                    sheets.append(
+                        {"name": worksheet.title, "metadata": metadata, "headers": headers, "rows": normalized_rows}
+                    )
+                elif sheet_rows:
+                    sheets.append(
+                        {"name": worksheet.title, "metadata": metadata, "headers": [], "rows": sheet_rows}
+                    )
+            client_national_id = next(
+                (
+                    str(item["value"]).strip()
+                    for sheet in sheets
+                    for item in sheet["metadata"]
+                    if item["label"].strip().upper() in {"ID", "NATIONAL ID"}
+                ),
+                None,
+            )
+            app_payments = []
+            if client_national_id:
+                db = get_db()
+                app_client = db.execute(
+                    "SELECT id FROM clients WHERE national_id = ?", (client_national_id,)
+                ).fetchone()
+                if app_client:
+                    payment_rows = db.execute(
+                        """SELECT p.*, c.name AS client_name, c.national_id,
+                                  l.principal_cents, l.total_due_cents,
+                                  SUM(p.amount_cents) OVER (
+                                    PARTITION BY p.loan_id ORDER BY p.id
+                                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                                  ) AS cumulative_paid_cents
+                           FROM payments p
+                           JOIN loans l ON l.id = p.loan_id
+                           JOIN clients c ON c.id = l.client_id
+                           WHERE c.id = ?
+                           ORDER BY p.id""",
+                        (app_client["id"],),
+                    ).fetchall()
+                    app_payments = [payment_row(row) for row in payment_rows]
+            return jsonify(
+                {
+                    "name": ledger["name"],
+                    "location": ledger["location"],
+                    "sheets": sheets,
+                    "app_payments": app_payments,
+                }
+            )
+        finally:
+            workbook.close()
+    except (OSError, ValueError, InvalidFileException, zipfile.BadZipFile) as exc:
+        app.logger.exception("Client ledger could not be opened")
+        return error(f"Could not open this client ledger: {exc}", 500)
+
+
+def save_docx(upload):
+    if upload is None or not upload.filename:
+        return "", ""
+    original_name = Path(upload.filename).name
+    if Path(original_name).suffix.lower() != ".docx":
+        raise ValueError("Registration form must be a Microsoft Word .docx file.")
+    content = upload.read()
+    if not content:
+        raise ValueError("The Word form is empty.")
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            if "[Content_Types].xml" not in archive.namelist() or "word/document.xml" not in archive.namelist():
+                raise ValueError("The uploaded file is not a valid .docx Word document.")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("The uploaded file is not a valid .docx Word document.") from exc
+
+    FORMS_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    stored_name = f"{uuid.uuid4().hex}.docx"
+    (FORMS_DIRECTORY / stored_name).write_bytes(content)
+    return stored_name, original_name
+
+
+@app.get("/api/session")
+def session_status():
+    user_id = session.get("user_id")
+    if not user_id:
+        return jsonify({"authenticated": False})
+    user = get_db().execute(
+        "SELECT id, username, full_name, role, active FROM staff_users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+    if user is None or not user["active"]:
+        session.clear()
+        return jsonify({"authenticated": False})
+    return jsonify(
+        {
+            "authenticated": True,
+            "username": user["username"],
+            "full_name": user["full_name"],
+            "role": user["role"],
+        }
+    )
+
+
+@app.post("/api/login")
+def login():
+    payload = request.get_json(silent=True) or {}
+    username = payload.get("username", "")
+    password = payload.get("password", "")
+    if not isinstance(username, str) or not isinstance(password, str):
+        return error("Username and password are required.")
+    user = get_db().execute(
+        "SELECT * FROM staff_users WHERE username = ? COLLATE NOCASE AND active = 1",
+        (username.strip(),),
+    ).fetchone()
+    if user is None or not check_password_hash(user["password_hash"], password):
+        return error("Invalid username or password.", 401)
+    session.clear()
+    session["user_id"] = user["id"]
+    return jsonify(
+        {
+            "authenticated": True,
+            "username": user["username"],
+            "full_name": user["full_name"],
+            "role": user["role"],
+        }
+    )
+
+
+@app.post("/api/logout")
+@staff_required
+def logout():
+    session.clear()
+    return jsonify({"authenticated": False})
+
+
+@app.get("/api/staff")
+@admin_required
+def staff_list():
+    rows = get_db().execute(
+        """SELECT id, username, full_name, role, active, created_at
+           FROM staff_users ORDER BY role, full_name"""
+    ).fetchall()
+    return jsonify([dict(row) for row in rows])
+
+
+@app.post("/api/staff")
+@admin_required
+def create_staff():
+    payload = request.get_json(silent=True) or {}
+    try:
+        username = required_text(payload, "username", "Username")
+        full_name = required_text(payload, "full_name", "Full name")
+        password = required_text(payload, "password", "Password")
+        if not re.fullmatch(r"[A-Za-z0-9._-]{3,40}", username):
+            return error("Username must be 3–40 characters using letters, numbers, dots, underscores or hyphens.")
+        if len(password) < 10:
+            return error("Staff passwords must be at least 10 characters.")
+        cursor = get_db().execute(
+            """INSERT INTO staff_users (username, full_name, password_hash, role, created_at)
+               VALUES (?, ?, ?, 'staff', ?)""",
+            (
+                username,
+                full_name,
+                generate_password_hash(password),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        get_db().commit()
+        return jsonify({"id": cursor.lastrowid}), 201
+    except ValueError as exc:
+        return error(str(exc))
+    except sqlite3.IntegrityError:
+        return error("That username is already in use.", 409)
+
+
+@app.get("/api/ledger.xlsx")
+@staff_required
+def download_excel_ledger():
+    try:
+        export_excel_ledger()
+    except (OSError, sqlite3.Error) as exc:
+        app.logger.exception("Excel ledger generation failed")
+        return error(f"Could not generate the Excel ledger: {exc}", 500)
+    return send_file(
+        EXCEL_LEDGER,
+        as_attachment=True,
+        download_name="Nama-Traders-Accounts-and-Payments.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.get("/api/dashboard")
+@staff_required
+def dashboard():
+    db = get_db()
+    today = date.today().isoformat()
+    summary = db.execute(
+        """SELECT
+             (SELECT COUNT(*) FROM clients) AS client_count,
+             (SELECT COUNT(*) FROM loans WHERE status = 'active') AS active_loans,
+             (SELECT COALESCE(SUM(l.total_due_cents - COALESCE(p.paid, 0)), 0)
+              FROM loans l LEFT JOIN
+                (SELECT loan_id, SUM(amount_cents) AS paid FROM payments GROUP BY loan_id) p
+              ON p.loan_id = l.id WHERE l.status = 'active') AS outstanding_cents,
+             (SELECT COUNT(*) FROM notifications WHERE status = 'failed') AS failed_notifications"""
+    ).fetchone()
+    due_today = db.execute(
+        """SELECT COUNT(*) FROM loans l LEFT JOIN
+             (SELECT loan_id, SUM(amount_cents) AS paid FROM payments GROUP BY loan_id) p
+           ON p.loan_id = l.id
+           WHERE l.status = 'active' AND l.due_on <= ? AND l.total_due_cents > COALESCE(p.paid, 0)""",
+        (today,),
+    ).fetchone()[0]
+    return jsonify(
+        {
+            "clients": summary["client_count"],
+            "active_loans": summary["active_loans"],
+            "outstanding": format_money(summary["outstanding_cents"]),
+            "failed_notifications": summary["failed_notifications"],
+            "overdue_loans": due_today,
+        }
+    )
+
+
+@app.get("/api/clients")
+@staff_required
+def clients():
+    rows = get_db().execute(
+        """SELECT c.*,
+             (SELECT l.id FROM loans l WHERE l.client_id = c.id AND l.status = 'active'
+              ORDER BY l.id DESC LIMIT 1) AS active_loan_id,
+             active_loan.principal_cents AS active_principal_cents,
+             active_loan.interest_cents AS active_interest_cents,
+             active_loan.total_due_cents AS active_total_due_cents,
+             COALESCE(active_payments.total_paid_cents, 0) AS active_total_paid_cents
+           FROM clients c
+           LEFT JOIN loans active_loan ON active_loan.id = (
+             SELECT l.id FROM loans l WHERE l.client_id = c.id AND l.status = 'active'
+             ORDER BY l.id DESC LIMIT 1
+           )
+           LEFT JOIN (
+             SELECT loan_id, SUM(amount_cents) AS total_paid_cents
+             FROM payments GROUP BY loan_id
+           ) active_payments ON active_payments.loan_id = active_loan.id
+           ORDER BY c.created_at DESC"""
+    ).fetchall()
+    return jsonify(
+        [
+            {
+                **client_row(row),
+                "active_total_balance": format_money(
+                    max(0, (row["active_total_due_cents"] or 0) - row["active_total_paid_cents"])
+                ),
+                "active_principal_balance": format_money(
+                    max(
+                        0,
+                        (row["active_principal_cents"] or 0)
+                        - allocated_principal_cents(
+                            row["active_principal_cents"] or 0,
+                            row["active_total_due_cents"] or 1,
+                            row["active_total_paid_cents"],
+                        ),
+                    )
+                ),
+                "active_interest_earned": format_money(
+                    max(
+                        0,
+                        row["active_total_paid_cents"]
+                        - allocated_principal_cents(
+                            row["active_principal_cents"] or 0,
+                            row["active_total_due_cents"] or 1,
+                            row["active_total_paid_cents"],
+                        ),
+                    )
+                ),
+            }
+            for row in rows
+        ]
+    )
+
+
+@app.post("/api/clients")
+@staff_required
+def create_client():
+    payload = request.form if request.mimetype == "multipart/form-data" else (
+        request.get_json(silent=True) or {}
+    )
+    fields = {
+        "name": "Client name",
+        "phone": "Phone number",
+        "national_id": "National ID",
+        "business_type": "Business type",
+        "business_location": "Business location",
+        "residence_location": "Residence location",
+        "guarantor_name": "Guarantor name",
+        "guarantor_phone": "Guarantor phone number",
+        "guarantor_national_id": "Guarantor national ID",
+        "guarantor_business_type": "Guarantor business type",
+        "guarantor_business_location": "Guarantor business location",
+        "guarantor_residence_location": "Guarantor residence location",
+    }
+    try:
+        values = [required_text(payload, key, label) for key, label in fields.items()]
+        phone = values[1]
+        if not re.fullmatch(r"\+?[0-9]{9,15}", phone):
+            return error("Enter a valid phone number using 9 to 15 digits, optionally prefixed with +.")
+        guarantor_phone = values[7]
+        if not re.fullmatch(r"\+?[0-9]{9,15}", guarantor_phone):
+            return error("Enter a valid guarantor phone number using 9 to 15 digits, optionally prefixed with +.")
+        form_file = request.files.get("form_file")
+        form_filename, form_original_name = save_docx(form_file)
+        db = get_db()
+        try:
+            cursor = db.execute(
+                """INSERT INTO clients (
+                     name, phone, national_id, business_type, business_location, residence_location,
+                     guarantor_name, guarantor_phone, guarantor_national_id, guarantor_business_type,
+                     guarantor_business_location, guarantor_residence_location, form_filename,
+                     form_original_name, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    *values[:7],
+                    guarantor_phone,
+                    *values[8:],
+                    form_filename,
+                    form_original_name,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            db.commit()
+        except sqlite3.IntegrityError:
+            db.rollback()
+            if form_filename:
+                (FORMS_DIRECTORY / form_filename).unlink(missing_ok=True)
+            return error("A client with that national ID already exists.", 409)
+        try:
+            export_excel_ledger()
+        except (OSError, sqlite3.Error) as exc:
+            app.logger.exception("Excel ledger update failed after client registration")
+            return error(f"Client was saved, but the Excel ledger could not be updated: {exc}", 500)
+        return jsonify({"id": cursor.lastrowid}), 201
+    except ValueError as exc:
+        return error(str(exc))
+
+
+@app.get("/api/clients/<int:client_id>/form")
+@staff_required
+def download_client_form(client_id):
+    row = get_db().execute(
+        "SELECT form_filename, form_original_name FROM clients WHERE id = ?", (client_id,)
+    ).fetchone()
+    if row is None:
+        return error("Client not found.", 404)
+    if not row["form_filename"]:
+        return error("No Word registration form is attached to this client.", 404)
+    return send_from_directory(
+        FORMS_DIRECTORY,
+        row["form_filename"],
+        as_attachment=True,
+        download_name=row["form_original_name"],
+    )
+
+
+@app.patch("/api/clients/<int:client_id>/account")
+@staff_required
+def update_account(client_id):
+    payload = request.get_json(silent=True) or {}
+    status = payload.get("status")
+    if status not in {"active", "paused"}:
+        return error("Account status must be active or paused.")
+    note = payload.get("note", "")
+    if not isinstance(note, str):
+        return error("Account note must be text.")
+    db = get_db()
+    cursor = db.execute(
+        "UPDATE clients SET account_status = ?, account_note = ? WHERE id = ?",
+        (status, note.strip(), client_id),
+    )
+    db.commit()
+    if cursor.rowcount == 0:
+        return error("Client not found.", 404)
+    return jsonify({"status": status})
+
+
+@app.get("/api/loans")
+@staff_required
+def loans():
+    db = get_db()
+    rows = db.execute(
+        """SELECT l.*, c.name AS client_name, c.national_id, c.phone, c.account_status
+           FROM loans l JOIN clients c ON c.id = l.client_id ORDER BY l.id DESC"""
+    ).fetchall()
+    return jsonify([loan_row(db, row) for row in rows])
+
+
+@app.post("/api/loans")
+@staff_required
+def create_loan():
+    payload = request.get_json(silent=True) or {}
+    try:
+        client_id = int(payload.get("client_id", 0))
+        principal_cents = money_to_cents(payload.get("principal"))
+        term_days = int(payload.get("term_days", 0))
+        interest_rate = Decimal(str(payload.get("interest_rate", "")))
+        if not interest_rate.is_finite() or interest_rate < 0 or interest_rate > 1000:
+            return error("Interest rate must be between 0 and 1000 percent.")
+        if term_days not in range(25, 31):
+            return error("Loan term must be between 25 and 30 days.")
+    except (ValueError, InvalidOperation, TypeError):
+        return error("Enter a valid client, principal, interest rate, and term.")
+
+    db = get_db()
+    client = db.execute("SELECT * FROM clients WHERE id = ?", (client_id,)).fetchone()
+    if client is None:
+        return error("Client not found.", 404)
+    if client["account_status"] != "active":
+        return error("This client account is paused.", 409)
+    active = db.execute(
+        "SELECT 1 FROM loans WHERE client_id = ? AND status = 'active'", (client_id,)
+    ).fetchone()
+    if active:
+        return error("This client already has an active loan.", 409)
+
+    interest_cents = int(
+        (Decimal(principal_cents) * interest_rate / Decimal(100)).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP
+        )
+    )
+    total_due_cents = principal_cents + interest_cents
+    issued_on = date.today()
+    cursor = db.execute(
+        """INSERT INTO loans
+           (client_id, principal_cents, interest_rate, interest_cents, total_due_cents,
+            term_days, issued_on, due_on, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            client_id,
+            principal_cents,
+            float(interest_rate),
+            interest_cents,
+            total_due_cents,
+            term_days,
+            issued_on.isoformat(),
+            (issued_on + timedelta(days=term_days)).isoformat(),
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    db.commit()
+    try:
+        export_excel_ledger()
+    except (OSError, sqlite3.Error) as exc:
+        app.logger.exception("Excel ledger update failed after loan issue")
+        return error(f"Loan was saved, but the Excel ledger could not be updated: {exc}", 500)
+    return jsonify({"id": cursor.lastrowid, "total_due": format_money(total_due_cents)}), 201
+
+
+@app.get("/api/payments")
+@staff_required
+def payments():
+    rows = get_db().execute(
+        """SELECT p.*, c.name AS client_name, c.national_id, l.principal_cents,
+                  l.total_due_cents,
+                  SUM(p.amount_cents) OVER (
+                    PARTITION BY p.loan_id ORDER BY p.id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                  ) AS cumulative_paid_cents
+           FROM payments p JOIN loans l ON l.id = p.loan_id
+           JOIN clients c ON c.id = l.client_id
+           ORDER BY p.id DESC LIMIT 200"""
+    ).fetchall()
+    return jsonify(
+        [payment_row(row) for row in rows]
+    )
+
+
+def payment_row(row):
+    row_data = dict(row)
+    previous_paid = row["cumulative_paid_cents"] - row["amount_cents"]
+    principal_paid = (
+        allocated_principal_cents(
+            row["principal_cents"], row["total_due_cents"], row["cumulative_paid_cents"]
+        )
+        - allocated_principal_cents(
+            row["principal_cents"], row["total_due_cents"], previous_paid
+        )
+    )
+    principal_remaining = max(
+        0,
+        row["principal_cents"]
+        - allocated_principal_cents(
+            row["principal_cents"], row["total_due_cents"], row["cumulative_paid_cents"]
+        ),
+    )
+    paid_at = parse_payment_time(row["paid_at"])
+    row_data.update(
+        amount=format_money(row["amount_cents"]),
+        original_total=format_money(row["total_due_cents"]),
+        principal_paid=format_money(principal_paid),
+        interest_earned=format_money(row["amount_cents"] - principal_paid),
+        principal_balance=format_money(principal_remaining),
+        balance=format_money(max(0, row["total_due_cents"] - row["cumulative_paid_cents"])),
+        paid_at=paid_at.isoformat(sep=" "),
+        payment_day=paid_at.strftime("%A"),
+        payment_date=paid_at.date().isoformat(),
+        payment_month=paid_at.strftime("%B"),
+        payment_year=paid_at.year,
+        payment_time=paid_at.strftime("%H:%M:%S"),
+    )
+    return row_data
+
+
+@app.get("/api/demo/payment-settings")
+@staff_required
+def demo_payment_settings():
+    return jsonify(
+        {
+            "enabled": os.environ.get("APP_ENV") != "production",
+            "paybill": PAYBILL or "Demo only — no live Paybill configured",
+        }
+    )
+
+
+@app.post("/api/demo/payments")
+@staff_required
+def create_demo_payment():
+    if os.environ.get("APP_ENV") == "production":
+        return error("Demo payments are disabled in production.", 403)
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return error("Expected a JSON demo payment.")
+    try:
+        client_id = int(payload.get("client_id", 0))
+        account_id = required_text(payload, "account_id", "Paybill account number")
+        amount_cents = money_to_cents(payload.get("amount"))
+    except (ValueError, TypeError):
+        return error("Enter a valid client, account number, and payment amount.")
+
+    db = get_db()
+    client = db.execute("SELECT * FROM clients WHERE id = ?", (client_id,)).fetchone()
+    if client is None:
+        return error("Client not found.", 404)
+    if account_id != client["national_id"]:
+        return error("The Paybill account number must match the client's National ID.", 400)
+    loan = db.execute(
+        "SELECT * FROM loans WHERE client_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
+        (client_id,),
+    ).fetchone()
+    if loan is None:
+        return error("No active loan is available for this client.", 409)
+
+    paid_so_far = db.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) FROM payments WHERE loan_id = ?",
+        (loan["id"],),
+    ).fetchone()[0]
+    balance = max(0, loan["total_due_cents"] - paid_so_far)
+    if amount_cents > balance:
+        return error(f"Payment cannot exceed the remaining total balance of KES {format_money(balance)}.")
+
+    paid_at = datetime.now().astimezone().replace(microsecond=0)
+    transaction_id = f"DEMO-{uuid.uuid4().hex[:12].upper()}"
+    demo_payload = {
+        "TransID": transaction_id,
+        "TransAmount": format_money(amount_cents),
+        "BusinessShortCode": PAYBILL or "DEMO",
+        "BillRefNumber": account_id,
+        "MSISDN": client["phone"],
+        "TransTime": paid_at.strftime("%Y%m%d%H%M%S"),
+    }
+    try:
+        db.execute(
+            """INSERT INTO payments (loan_id, transaction_id, amount_cents, phone, paid_at, raw_payload)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                loan["id"],
+                transaction_id,
+                amount_cents,
+                client["phone"],
+                paid_at.isoformat(sep=" "),
+                json.dumps(demo_payload),
+            ),
+        )
+        total_paid = paid_so_far + amount_cents
+        if total_paid >= loan["total_due_cents"]:
+            db.execute("UPDATE loans SET status = 'settled' WHERE id = ?", (loan["id"],))
+        db.commit()
+    except sqlite3.IntegrityError:
+        db.rollback()
+        return error("Could not record this demo payment.", 409)
+
+    try:
+        export_excel_ledger()
+    except (OSError, sqlite3.Error) as exc:
+        app.logger.exception("Excel ledger update failed after demo payment")
+        return error(f"Payment was recorded, but the Excel ledger could not be updated: {exc}", 500)
+    return jsonify(
+        {
+            "accepted": True,
+            "demo": True,
+            "transaction_id": transaction_id,
+            "amount": format_money(amount_cents),
+            "balance": format_money(max(0, loan["total_due_cents"] - total_paid)),
+        }
+    ), 201
+
+
+@app.post("/api/mpesa/callback")
+def mpesa_callback():
+    if not CALLBACK_TOKEN:
+        return error("M-Pesa callback is not configured.", 503)
+    supplied_token = request.headers.get("X-Callback-Token", "")
+    if not hmac.compare_digest(supplied_token, CALLBACK_TOKEN):
+        return error("Unauthorized callback.", 401)
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return error("Expected a JSON payment callback.")
+    try:
+        transaction_id = required_text(payload, "TransID", "Transaction ID")
+        account_id = required_text(payload, "BillRefNumber", "Paybill account reference")
+        amount_cents = money_to_cents(payload.get("TransAmount"))
+        shortcode = str(payload.get("BusinessShortCode", "")).strip()
+        if PAYBILL and shortcode != PAYBILL:
+            return error("Payment was received for an unexpected Paybill.", 400)
+    except ValueError as exc:
+        return error(str(exc))
+
+    db = get_db()
+    client = db.execute(
+        "SELECT * FROM clients WHERE national_id = ?", (account_id,)
+    ).fetchone()
+    if client is None:
+        return error("No client is registered with this account reference.", 404)
+    loan = db.execute(
+        "SELECT * FROM loans WHERE client_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
+        (client["id"],),
+    ).fetchone()
+    if loan is None:
+        return error("No active loan is available for this payment.", 409)
+
+    try:
+        paid_at = parse_payment_time(payload.get("TransTime")).isoformat(sep=" ")
+    except ValueError as exc:
+        return error(str(exc))
+    try:
+        db.execute(
+            """INSERT INTO payments (loan_id, transaction_id, amount_cents, phone, paid_at, raw_payload)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                loan["id"],
+                transaction_id,
+                amount_cents,
+                str(payload.get("MSISDN", "")),
+                paid_at,
+                request.get_data(as_text=True),
+            ),
+        )
+    except sqlite3.IntegrityError:
+        try:
+            export_excel_ledger()
+        except (OSError, sqlite3.Error) as exc:
+            app.logger.exception("Excel ledger update failed while recovering duplicate payment")
+            return error(f"Duplicate payment is already recorded, but the Excel ledger could not be updated: {exc}", 500)
+        return jsonify({"accepted": True, "duplicate": True}), 200
+
+    paid = db.execute(
+        "SELECT SUM(amount_cents) FROM payments WHERE loan_id = ?", (loan["id"],)
+    ).fetchone()[0]
+    if paid >= loan["total_due_cents"]:
+        db.execute("UPDATE loans SET status = 'settled' WHERE id = ?", (loan["id"],))
+    balance = max(0, loan["total_due_cents"] - paid)
+    message = (
+        f"Payment of KES {format_money(amount_cents)} received. "
+        f"Loan issued: KES {format_money(loan['principal_cents'])}; "
+        f"balance: KES {format_money(balance)}; due date: {loan['due_on']}."
+    )
+    db.commit()
+    queue_notification(db, client["id"], loan["id"], f"payment:{transaction_id}", message)
+    try:
+        export_excel_ledger()
+    except (OSError, sqlite3.Error) as exc:
+        app.logger.exception("Excel ledger update failed after Paybill payment")
+        return error(f"Payment was recorded, but the Excel ledger could not be updated: {exc}", 500)
+    return jsonify({"accepted": True, "balance": format_money(balance)})
+
+
+def run_daily_reminders():
+    db = connect_db()
+    today = date.today()
+    rows = db.execute(
+        """SELECT l.*, c.id AS client_id, c.name, c.national_id,
+                  COALESCE(p.paid, 0) AS paid
+           FROM loans l JOIN clients c ON c.id = l.client_id
+           LEFT JOIN (SELECT loan_id, SUM(amount_cents) AS paid FROM payments GROUP BY loan_id) p
+             ON p.loan_id = l.id
+           WHERE l.status = 'active'"""
+    ).fetchall()
+    queued = 0
+    try:
+        for loan in rows:
+            age_days = (today - date.fromisoformat(loan["issued_on"])).days
+            if age_days == 25 and loan["paid"] < loan["total_due_cents"]:
+                balance = loan["total_due_cents"] - loan["paid"]
+                message = (
+                    f"Reminder: your loan payment is delayed. Outstanding balance: "
+                    f"KES {format_money(balance)}; due date: {loan['due_on']}."
+                )
+                notification_id = queue_notification(
+                    db, loan["client_id"], loan["id"], "day_25_reminder", message
+                )
+                queued += int(notification_id is not None)
+    finally:
+        db.close()
+    return queued
+
+
+@app.get("/api/notifications")
+@staff_required
+def notifications():
+    rows = get_db().execute(
+        """SELECT n.*, c.name AS client_name, c.phone
+           FROM notifications n JOIN clients c ON c.id = n.client_id
+           ORDER BY n.id DESC LIMIT 200"""
+    ).fetchall()
+    return jsonify([dict(row) for row in rows])
+
+
+@app.cli.command("send-daily-reminders")
+def send_daily_reminders_command():
+    """Create and deliver the day-25 late-payment reminders."""
+    count = run_daily_reminders()
+    print(f"Processed day-25 reminders: {count}")
+
+
+if __name__ == "__main__":
+    app.run(debug=os.environ.get("APP_DEBUG", "false").lower() == "true")

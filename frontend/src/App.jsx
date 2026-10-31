@@ -1,0 +1,642 @@
+import { useCallback, useEffect, useState } from "react";
+
+const blankClient = {
+  name: "",
+  phone: "",
+  national_id: "",
+  business_type: "",
+  business_location: "",
+  residence_location: "",
+  guarantor_name: "",
+  guarantor_phone: "",
+  guarantor_national_id: "",
+  guarantor_business_type: "",
+  guarantor_business_location: "",
+  guarantor_residence_location: "",
+};
+
+async function api(path, options = {}) {
+  const headers = { ...options.headers };
+  if (!(options.body instanceof FormData)) headers["Content-Type"] = "application/json";
+  const response = await fetch(path, {
+    credentials: "same-origin",
+    headers,
+    ...options,
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "Request failed.");
+  return data;
+}
+
+function money(value) {
+  return `KES ${Number(value || 0).toLocaleString("en-KE", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+function App() {
+  const [authenticated, setAuthenticated] = useState(false);
+  const [role, setRole] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [section, setSection] = useState("Overview");
+  const [dashboard, setDashboard] = useState(null);
+  const [clients, setClients] = useState([]);
+  const [loans, setLoans] = useState([]);
+  const [payments, setPayments] = useState([]);
+  const [notifications, setNotifications] = useState([]);
+  const [staff, setStaff] = useState([]);
+  const [ledgerFiles, setLedgerFiles] = useState([]);
+  const [selectedLedger, setSelectedLedger] = useState(null);
+  const [ledgerData, setLedgerData] = useState(null);
+  const [ledgerLoading, setLedgerLoading] = useState(false);
+  const [demoPaymentSettings, setDemoPaymentSettings] = useState({ enabled: false, paybill: "" });
+  const [demoPaymentForm, setDemoPaymentForm] = useState({ client_id: "", amount: "" });
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+  const [clientForm, setClientForm] = useState(blankClient);
+  const [formFile, setFormFile] = useState(null);
+  const [staffForm, setStaffForm] = useState({ username: "", full_name: "", password: "" });
+  const [loanForm, setLoanForm] = useState({
+    client_id: "",
+    principal: "",
+    interest_rate: "25",
+    term_days: "25",
+  });
+
+  const loadData = useCallback(async () => {
+    try {
+      const [stats, clientRows, loanRows, paymentRows, notificationRows] = await Promise.all([
+        api("/api/dashboard"),
+        api("/api/clients"),
+        api("/api/loans"),
+        api("/api/payments"),
+        api("/api/notifications"),
+      ]);
+      setDashboard(stats);
+      setClients(clientRows);
+      setLoans(loanRows);
+      setPayments(paymentRows);
+      setNotifications(notificationRows);
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }, []);
+
+  useEffect(() => {
+    api("/api/session")
+      .then(({ authenticated: isAuthenticated, role: currentRole }) => {
+        setAuthenticated(isAuthenticated);
+        setRole(currentRole || "");
+        if (isAuthenticated) return loadData();
+        return undefined;
+      })
+      .catch((requestError) => setError(requestError.message))
+      .finally(() => setLoading(false));
+  }, [loadData]);
+
+  useEffect(() => {
+    if (authenticated && role === "admin") {
+      api("/api/staff").then(setStaff).catch((requestError) => setError(requestError.message));
+    }
+  }, [authenticated, role]);
+
+  useEffect(() => {
+    if (authenticated && section === "Ledgers") {
+      api("/api/client-ledgers").then(setLedgerFiles).catch((requestError) => setError(requestError.message));
+    }
+  }, [authenticated, section]);
+
+  useEffect(() => {
+    if (authenticated) {
+      api("/api/demo/payment-settings")
+        .then(setDemoPaymentSettings)
+        .catch((requestError) => setError(requestError.message));
+    }
+  }, [authenticated]);
+
+  async function submit(action, message) {
+    setError("");
+    setSuccess("");
+    try {
+      await action();
+      await loadData();
+      setSuccess(message);
+      return true;
+    } catch (requestError) {
+      setError(requestError.message);
+      return false;
+    }
+  }
+
+  async function login(event) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const ok = await submit(
+      async () => {
+        const account = await api("/api/login", {
+          method: "POST",
+          body: JSON.stringify({
+            username: form.get("username"),
+            password: form.get("password"),
+          }),
+        });
+        setRole(account.role);
+        setAuthenticated(true);
+      },
+      "Welcome back.",
+    );
+    if (ok) await loadData();
+  }
+
+  async function logout() {
+    await submit(async () => {
+      await api("/api/logout", { method: "POST" });
+      setAuthenticated(false);
+      setRole("");
+    }, "You have been signed out.");
+  }
+
+  async function saveClient(event) {
+    event.preventDefault();
+    const body = new FormData();
+    Object.entries(clientForm).forEach(([key, value]) => body.append(key, value));
+    if (formFile) body.append("form_file", formFile);
+    const ok = await submit(
+      () => api("/api/clients", { method: "POST", body }),
+      "Client registered and added to the Excel ledger.",
+    );
+    if (ok) {
+      setClientForm(blankClient);
+      setFormFile(null);
+    }
+  }
+
+  async function saveLoan(event) {
+    event.preventDefault();
+    const ok = await submit(
+      () => api("/api/loans", { method: "POST", body: JSON.stringify(loanForm) }),
+      "Loan issued and added to the ledger.",
+    );
+    if (ok) setLoanForm({ ...loanForm, client_id: "", principal: "" });
+  }
+
+  async function setAccount(client, status) {
+    await submit(
+      () =>
+        api(`/api/clients/${client.id}/account`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            status,
+            note: status === "paused" ? "Paused by staff." : "",
+          }),
+        }),
+      `Account ${status}.`,
+    );
+  }
+
+  async function saveStaff(event) {
+    event.preventDefault();
+    const ok = await submit(async () => {
+      await api("/api/staff", { method: "POST", body: JSON.stringify(staffForm) });
+      setStaff(await api("/api/staff"));
+    }, "Staff account created.");
+    if (ok) setStaffForm({ username: "", full_name: "", password: "" });
+  }
+
+  async function openLedger(ledger) {
+    setSelectedLedger(ledger);
+    setLedgerData(null);
+    setLedgerLoading(true);
+    setError("");
+    try {
+      setLedgerData(await api(`/api/client-ledgers/${ledger.id}`));
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setLedgerLoading(false);
+    }
+  }
+
+  async function saveDemoPayment(event) {
+    event.preventDefault();
+    const client = clients.find((row) => String(row.id) === demoPaymentForm.client_id);
+    if (!client) return;
+    const ok = await submit(
+      () => api("/api/demo/payments", {
+        method: "POST",
+        body: JSON.stringify({
+          client_id: client.id,
+          account_id: client.national_id,
+          amount: demoPaymentForm.amount,
+        }),
+      }),
+      "Demo payment recorded. No real M-Pesa transaction was sent.",
+    );
+    if (ok) setDemoPaymentForm((current) => ({ ...current, amount: "" }));
+  }
+
+  if (loading) return <div className="loading">Loading Nama Traders…</div>;
+  if (!authenticated) {
+    return (
+      <main className="login-page">
+        <form className="login-card" onSubmit={login}>
+          <div className="brand-mark">NT</div>
+          <p className="eyebrow">STAFF PORTAL</p>
+          <h1>Welcome back</h1>
+          <p className="muted">Sign in to manage clients, loans, and repayments.</p>
+          {error && <div className="alert error">{error}</div>}
+          <label>
+            Username
+            <input name="username" autoComplete="username" required />
+          </label>
+          <label>
+            Password
+            <input name="password" type="password" autoComplete="current-password" required />
+          </label>
+          <button className="primary full" type="submit">Sign in</button>
+          <p className="hint">Local demo: admin / admin123</p>
+        </form>
+      </main>
+    );
+  }
+
+  const nav = ["Overview", "Clients", "Ledgers", "Loans", "Payments", "Notifications"];
+  if (role === "admin") nav.push("Staff");
+  const demoLoans = loans.filter((loan) => loan.status === "active" && Number(loan.balance) > 0);
+  const selectedDemoLoan = demoLoans.find(
+    (loan) => String(loan.client_id) === demoPaymentForm.client_id,
+  );
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand"><span className="brand-mark">NT</span><strong>Nama Traders</strong></div>
+        <p className="nav-label">WORKSPACE</p>
+        <nav>
+          {nav.map((item) => (
+            <button
+              className={`nav-item ${section === item ? "selected" : ""}`}
+              key={item}
+              title={item}
+              aria-label={item}
+              onClick={() => setSection(item)}
+            >
+              <span className="nav-dot" />{item}
+            </button>
+          ))}
+        </nav>
+        <div className="sidebar-note">
+          <strong>Paybill only</strong>
+          <p>Cash payments are not accepted. Use the client’s National ID as the Paybill account.</p>
+        </div>
+        <button className="logout" onClick={logout}>Sign out</button>
+      </aside>
+      <main className="main">
+        <header className="topbar">
+          <div><p className="eyebrow">LOAN MANAGEMENT</p><h1>{section}</h1></div>
+          <div className="topbar-actions"><div className="staff-avatar">{role === "admin" ? "A" : "S"}</div></div>
+        </header>
+        {error && <div className="alert error" role="alert">{error}<button onClick={() => setError("")}>×</button></div>}
+        {success && <div className="alert success" role="status">{success}<button onClick={() => setSuccess("")}>×</button></div>}
+
+        {section === "Overview" && (
+          <>
+            <section className="stats-grid">
+              <Stat label="Registered clients" value={dashboard?.clients ?? 0} icon="01" />
+              <Stat label="Active loans" value={dashboard?.active_loans ?? 0} icon="02" />
+              <Stat label="Outstanding balance" value={money(dashboard?.outstanding)} icon="03" />
+              <Stat label="Overdue loans" value={dashboard?.overdue_loans ?? 0} icon="04" />
+            </section>
+            {dashboard?.failed_notifications > 0 && (
+              <div className="alert warning">{dashboard.failed_notifications} notification delivery/deliveries failed. Check the Notifications tab and webhook configuration.</div>
+            )}
+            <div className="panel">
+              <div className="panel-heading"><div><h2>Recent loans</h2><p>Latest activity across client accounts</p></div><button className="text-button" onClick={() => setSection("Loans")}>View all →</button></div>
+              <LoanTable rows={loans.slice(0, 5)} />
+            </div>
+          </>
+        )}
+
+        {section === "Clients" && (
+          <div className="content-grid">
+            <section className="panel">
+              <div className="panel-heading"><div><h2>Client register</h2><p>Clients, guarantors and generated forms</p></div></div>
+              <ClientTable rows={clients} onToggle={setAccount} />
+            </section>
+            <form className="panel form-panel" onSubmit={saveClient}>
+              <div className="panel-heading"><div><h2>Register a client</h2><p>Enter client and guarantor details</p></div></div>
+              <div className="form-section">CLIENT DETAILS</div>
+              <div className="form-grid">
+                <Field label="Full name" name="name" value={clientForm.name} onChange={updateClient(setClientForm)} required />
+                <Field label="Phone number" name="phone" value={clientForm.phone} onChange={updateClient(setClientForm)} placeholder="+254…" required />
+                <Field label="National ID" name="national_id" value={clientForm.national_id} onChange={updateClient(setClientForm)} required />
+                <Field label="Business type" name="business_type" value={clientForm.business_type} onChange={updateClient(setClientForm)} required />
+                <Field label="Business location" name="business_location" value={clientForm.business_location} onChange={updateClient(setClientForm)} required />
+                <Field label="Residence location" name="residence_location" value={clientForm.residence_location} onChange={updateClient(setClientForm)} required />
+                <label className="span-two">Registration form (.docx, optional)
+                  <input
+                    type="file"
+                    accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    onChange={(event) => setFormFile(event.target.files?.[0] || null)}
+                  />
+                </label>
+              </div>
+              <div className="form-section">GUARANTOR DETAILS</div>
+              <div className="form-grid">
+                <Field label="Full name" name="guarantor_name" value={clientForm.guarantor_name} onChange={updateClient(setClientForm)} required />
+                <Field label="Phone number" name="guarantor_phone" value={clientForm.guarantor_phone} onChange={updateClient(setClientForm)} placeholder="+254…" required />
+                <Field label="National ID" name="guarantor_national_id" value={clientForm.guarantor_national_id} onChange={updateClient(setClientForm)} required />
+                <Field label="Business type" name="guarantor_business_type" value={clientForm.guarantor_business_type} onChange={updateClient(setClientForm)} required />
+                <Field label="Business location" name="guarantor_business_location" value={clientForm.guarantor_business_location} onChange={updateClient(setClientForm)} required />
+                <Field className="span-two" label="Residence location" name="guarantor_residence_location" value={clientForm.guarantor_residence_location} onChange={updateClient(setClientForm)} required />
+              </div>
+              <button className="primary" type="submit">Save client</button>
+            </form>
+          </div>
+        )}
+
+        {section === "Ledgers" && (
+          <LedgerBrowser
+            ledgers={ledgerFiles}
+            selected={selectedLedger}
+            data={ledgerData}
+            loading={ledgerLoading}
+            onSelect={openLedger}
+          />
+        )}
+
+        {section === "Loans" && (
+          <div className="stack">
+            <form className="panel loan-form" onSubmit={saveLoan}>
+              <div className="panel-heading"><div><h2>Issue a loan</h2><p>Total due = principal + flat interest. Repayments start the day after issue.</p></div></div>
+              <div className="loan-fields">
+                <label>Client
+                  <select value={loanForm.client_id} onChange={(event) => setLoanForm({ ...loanForm, client_id: event.target.value })} required>
+                    <option value="">Select an eligible client</option>
+                    {clients.filter((client) => client.account_status === "active" && !client.active_loan_id).map((client) => (
+                      <option key={client.id} value={client.id}>{client.name} · ID {client.national_id}</option>
+                    ))}
+                  </select>
+                </label>
+                <Field label="Principal (KES)" name="principal" type="number" min="0.01" step="0.01" value={loanForm.principal} onChange={(event) => setLoanForm({ ...loanForm, principal: event.target.value })} required />
+                <Field label="Flat interest (%)" name="interest_rate" type="number" min="0" max="1000" step="0.01" value={loanForm.interest_rate} onChange={(event) => setLoanForm({ ...loanForm, interest_rate: event.target.value })} required />
+                <label>Term
+                  <select value={loanForm.term_days} onChange={(event) => setLoanForm({ ...loanForm, term_days: event.target.value })}>
+                    {[25, 26, 27, 28, 29, 30].map((days) => <option key={days} value={days}>{days} days</option>)}
+                  </select>
+                </label>
+              </div>
+              <button className="primary" type="submit">Issue loan</button>
+            </form>
+            <section className="panel"><div className="panel-heading"><div><h2>Loan ledger</h2><p>Principal, interest, payment balance, and due date</p></div></div><LoanTable rows={loans} /></section>
+          </div>
+        )}
+
+        {section === "Payments" && (
+          <div className="stack">
+            <form className="panel demo-payment" onSubmit={saveDemoPayment}>
+              <div className="panel-heading">
+                <div><h2>Try a Paybill payment</h2><p>Match a client using their National ID as the Paybill account number.</p></div>
+                <span className="badge orange">DEMO ONLY</span>
+              </div>
+              <div className="demo-notice">This records a simulated payment in the app. It does not contact M-Pesa or move real money.</div>
+              <div className="demo-payment-fields">
+                <label>Paybill
+                  <input value={demoPaymentSettings.paybill} readOnly />
+                </label>
+                <label>Client / loan
+                  <select
+                    value={demoPaymentForm.client_id}
+                    onChange={(event) => setDemoPaymentForm({ ...demoPaymentForm, client_id: event.target.value })}
+                    required
+                  >
+                    <option value="">Select an active loan</option>
+                    {demoLoans.map((loan) => (
+                      <option key={loan.id} value={loan.client_id}>
+                        {loan.client_name} · ID {loan.national_id} · balance {money(loan.balance)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>Paybill account number (National ID)
+                  <input value={selectedDemoLoan?.national_id || ""} readOnly placeholder="Select a client first" />
+                </label>
+                <Field
+                  label="Amount paid (KES)"
+                  name="amount"
+                  type="number"
+                  min="0.01"
+                  max={selectedDemoLoan?.balance || undefined}
+                  step="0.01"
+                  value={demoPaymentForm.amount}
+                  onChange={(event) => setDemoPaymentForm({ ...demoPaymentForm, amount: event.target.value })}
+                  required
+                />
+              </div>
+              {selectedDemoLoan && (
+                <div className="demo-loan-summary">
+                  <span>Principal balance <strong>{money(selectedDemoLoan.principal_balance)}</strong></span>
+                  <span>Interest earned <strong>{money(selectedDemoLoan.interest_earned)}</strong></span>
+                  <span>Total due <strong>{money(selectedDemoLoan.total_due)}</strong></span>
+                  <span>Total balance <strong>{money(selectedDemoLoan.balance)}</strong></span>
+                </div>
+              )}
+              <button className="primary" type="submit" disabled={!demoPaymentSettings.enabled || !selectedDemoLoan}>Record demo payment</button>
+            </form>
+            <section className="panel">
+              <div className="panel-heading"><div><h2>Payment history</h2><p>Principal and interest allocation follows the loan’s interest rate, with the ledger’s 25% split when applicable.</p></div><span className="badge orange">PAYBILL ONLY</span></div>
+              <DataTable
+                headers={["Transaction", "Client", "Account ID", "Original Total", "Amount Paid", "Principal Repaid", "Interest Earned", "Principal Balance", "Total Balance", "Day", "Date", "Month", "Year", "Time"]}
+                rows={payments.map((row) => [
+                  row.transaction_id, row.client_name, row.national_id, money(row.original_total),
+                  money(row.amount), money(row.principal_paid), money(row.interest_earned),
+                  money(row.principal_balance), money(row.balance), row.payment_day,
+                  row.payment_date, row.payment_month, row.payment_year, row.payment_time,
+                ])}
+                empty="No Paybill deposits received yet."
+              />
+            </section>
+          </div>
+        )}
+
+        {section === "Notifications" && (
+          <section className="panel">
+            <div className="panel-heading"><div><h2>Notification log</h2><p>Payment receipts, balances, due dates, and late reminders</p></div></div>
+            <DataTable headers={["Client", "Message", "Status", "Created"]} rows={notifications.map((row) => [row.client_name, row.message, <span className={`badge ${row.status}`}>{row.status}{row.error ? `: ${row.error}` : ""}</span>, row.created_at])} />
+            {!notifications.length && <Empty text="Notifications will appear here when generated." />}
+          </section>
+        )}
+
+        {section === "Staff" && role === "admin" && (
+          <div className="content-grid staff-layout">
+            <section className="panel">
+              <div className="panel-heading"><div><h2>Staff accounts</h2><p>People with access to the loan management system</p></div></div>
+              <DataTable
+                headers={["Name", "Username", "Access", "Status", "Added"]}
+                rows={staff.map((member) => [
+                  member.full_name, member.username, member.role,
+                  <span className={`badge ${member.active ? "active" : "paused"}`}>{member.active ? "active" : "inactive"}</span>,
+                  member.created_at,
+                ])}
+                empty="No staff accounts yet."
+              />
+            </section>
+            <form className="panel form-panel" onSubmit={saveStaff}>
+              <div className="panel-heading"><div><h2>Add staff member</h2><p>New accounts receive standard staff access, not admin rights.</p></div></div>
+              <div className="form-grid one-column">
+                <Field label="Full name" name="full_name" value={staffForm.full_name} onChange={(event) => setStaffForm({ ...staffForm, full_name: event.target.value })} required />
+                <Field label="Username" name="username" value={staffForm.username} onChange={(event) => setStaffForm({ ...staffForm, username: event.target.value })} minLength="3" maxLength="40" required />
+                <Field label="Temporary password (10+ characters)" name="password" type="password" value={staffForm.password} onChange={(event) => setStaffForm({ ...staffForm, password: event.target.value })} minLength="10" autoComplete="new-password" required />
+              </div>
+              <button className="primary" type="submit">Create staff account</button>
+            </form>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+function updateClient(setter) {
+  return (event) => setter((current) => ({ ...current, [event.target.name]: event.target.value }));
+}
+
+function Field({ label, className = "", ...props }) {
+  return <label className={className}>{label}<input {...props} /></label>;
+}
+
+function Stat({ label, value, icon }) {
+  return <article className="stat-card"><span className="stat-icon">{icon}</span><p>{label}</p><strong>{value}</strong></article>;
+}
+
+function ClientTable({ rows, onToggle }) {
+  if (!rows.length) return <Empty text="No clients registered yet." />;
+  return (
+    <div className="table-wrap"><table><thead><tr><th>Client</th><th>National ID</th><th>Phone</th><th>Principal Balance</th><th>Total Balance</th><th>Interest Earned</th><th>Form</th><th>Account</th><th>Action</th></tr></thead>
+      <tbody>{rows.map((client) => <tr key={client.id}>
+        <td><strong>{client.name}</strong><small>{client.business_type}</small></td>
+        <td>{client.national_id}</td><td>{client.phone}</td>
+        <td>{client.active_loan_id ? money(client.active_principal_balance) : "—"}</td>
+        <td>{client.active_loan_id ? money(client.active_total_balance) : "—"}</td>
+        <td>{client.active_loan_id ? money(client.active_interest_earned) : "—"}</td>
+        <td>{client.form_filename ? <a href={`/api/clients/${client.id}/form`}>{client.form_original_name || "Download Word form ↗"}</a> : <span className="muted">—</span>}</td>
+        <td><span className={`badge ${client.account_status}`}>{client.account_status}</span></td>
+        <td><button className="text-button small" onClick={() => onToggle(client, client.account_status === "active" ? "paused" : "active")}>{client.account_status === "active" ? "Pause" : "Reopen"}</button></td>
+      </tr>)}</tbody>
+    </table></div>
+  );
+}
+
+function LoanTable({ rows }) {
+  return <DataTable headers={["Client", "Principal", "Interest", "Total due", "Paid", "Interest earned", "Principal balance", "Total balance", "Due date", "Status"]} rows={rows.map((loan) => [
+    <><strong>{loan.client_name}</strong><small>ID {loan.national_id}</small></>,
+    money(loan.principal), money(loan.interest), money(loan.total_due),
+    money(loan.paid), money(loan.interest_earned), money(loan.principal_balance),
+    money(loan.balance), loan.due_on,
+    <span className={`badge ${loan.status}`}>{loan.status}</span>,
+  ])} empty="No loans have been issued." />;
+}
+
+function DataTable({ headers, rows, empty }) {
+  if (!rows.length) return <Empty text={empty || "Nothing to show yet."} />;
+  return <div className="table-wrap"><table><thead><tr>{headers.map((header) => <th key={header}>{header}</th>)}</tr></thead><tbody>
+    {rows.map((row, index) => <tr key={index}>{row.map((cell, cellIndex) => <td key={cellIndex}>{cell}</td>)}</tr>)}
+  </tbody></table></div>;
+}
+
+function Empty({ text }) {
+  return <div className="empty"><span>◌</span><p>{text}</p></div>;
+}
+
+function LedgerBrowser({ ledgers, selected, data, loading, onSelect }) {
+  const [query, setQuery] = useState("");
+  const visibleLedgers = ledgers.filter((ledger) =>
+    `${ledger.name} ${ledger.location}`.toLowerCase().includes(query.trim().toLowerCase()),
+  );
+  return (
+    <div className="ledger-browser">
+      <section className="panel ledger-list">
+        <div className="panel-heading"><div><h2>Client ledgers</h2><p>{ledgers.length} workbooks available</p></div></div>
+        <label className="ledger-search">
+          Search by client
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Enter client name…" />
+        </label>
+        <div className="ledger-list-items">
+          {visibleLedgers.map((ledger) => (
+            <button
+              className={`ledger-list-item ${selected?.id === ledger.id ? "selected" : ""}`}
+              key={ledger.id}
+              onClick={() => onSelect(ledger)}
+            >
+              <span className="ledger-avatar">{ledger.name.trim().charAt(0).toUpperCase() || "L"}</span>
+              <span><strong>{ledger.name}</strong><small>{ledger.location || "Main folder"}</small></span>
+              <span className="ledger-arrow">›</span>
+            </button>
+          ))}
+          {!visibleLedgers.length && <Empty text={ledgers.length ? "No clients match that search." : "No client workbooks found."} />}
+        </div>
+      </section>
+      <section className="panel ledger-detail">
+        {!selected && <Empty text="Select a client to view their ledger here." />}
+        {loading && <div className="loading-inline">Opening {selected?.name}’s ledger…</div>}
+        {!loading && data && (
+          <>
+            <div className="panel-heading ledger-detail-heading">
+              <div><p className="eyebrow">CLIENT LEDGER · {data.location || "MAIN FOLDER"}</p><h2>{data.name}</h2></div>
+              <span className="ledger-view-badge">Live from workbook</span>
+            </div>
+            {data.sheets.map((sheet) => (
+              <section className="ledger-sheet" key={sheet.name}>
+                {sheet.metadata.length > 0 && (
+                  <div className="ledger-metadata">
+                    {sheet.metadata.map((item, index) => (
+                      <div key={`${item.label}-${index}`}><small>{item.label}</small><strong>{item.value}</strong></div>
+                    ))}
+                  </div>
+                )}
+                {sheet.headers.length > 0 && (
+                  <div className="table-wrap">
+                    <table className="ledger-table">
+                      <thead><tr>{sheet.headers.map((header, index) => <th key={`${header}-${index}`}>{header}</th>)}</tr></thead>
+                      <tbody>
+                        {sheet.rows.map((row, rowIndex) => {
+                          const loanHeading = String(row[1] || "").trim().toUpperCase() === "LOANED";
+                          return (
+                            <tr className={loanHeading ? "ledger-loan-heading" : ""} key={rowIndex}>
+                              {row.map((value, cellIndex) => (
+                                <td key={cellIndex}>{value == null || value === "" ? "—" : typeof value === "number" ? value.toLocaleString("en-KE", { maximumFractionDigits: 2 }) : value}</td>
+                              ))}
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </section>
+            ))}
+            <section className="ledger-sheet app-ledger-activity">
+              <div className="panel-heading">
+                <div><h2>Nama Traders payment activity</h2><p>App-recorded payments matched to this client by National ID. Original workbook remains unchanged.</p></div>
+                <span className="badge orange">APP RECORDS</span>
+              </div>
+              <DataTable
+                headers={["Transaction", "Amount Paid", "Principal Repaid", "Interest Earned", "Principal Balance", "Total Balance", "Day", "Date", "Month", "Year", "Time"]}
+                rows={(data.app_payments || []).map((payment) => [
+                  payment.transaction_id, money(payment.amount), money(payment.principal_paid),
+                  money(payment.interest_earned), money(payment.principal_balance), money(payment.balance),
+                  payment.payment_day, payment.payment_date, payment.payment_month,
+                  payment.payment_year, payment.payment_time,
+                ])}
+                empty="No payments have been recorded in Nama Traders for this client."
+              />
+            </section>
+            {!data.sheets.length && <Empty text="This workbook has no readable ledger table." />}
+          </>
+        )}
+      </section>
+    </div>
+  );
+}
+
+export default App;

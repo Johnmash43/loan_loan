@@ -45,6 +45,7 @@ function App() {
   const [loans, setLoans] = useState([]);
   const [payments, setPayments] = useState([]);
   const [notifications, setNotifications] = useState([]);
+  const [renewalRequests, setRenewalRequests] = useState([]);
   const [staff, setStaff] = useState([]);
   const [ledgerFiles, setLedgerFiles] = useState([]);
   const [selectedLedger, setSelectedLedger] = useState(null);
@@ -63,25 +64,43 @@ function App() {
     interest_rate: "25",
     term_days: "25",
   });
+  const [renewalForm, setRenewalForm] = useState({
+    renewal_request_id: "",
+    loan_number: "",
+    principal: "",
+    total_due: "",
+    issued_on: "",
+    due_on: "",
+  });
 
   const loadData = useCallback(async () => {
     try {
-      const [stats, clientRows, loanRows, paymentRows, notificationRows] = await Promise.all([
+      const [stats, clientRows, loanRows, paymentRows, notificationRows, renewals] = await Promise.all([
         api("/api/dashboard"),
         api("/api/clients"),
         api("/api/loans"),
         api("/api/payments"),
         api("/api/notifications"),
+        api("/api/renewal-requests"),
       ]);
       setDashboard(stats);
       setClients(clientRows);
       setLoans(loanRows);
       setPayments(paymentRows);
       setNotifications(notificationRows);
+      setRenewalRequests(renewals);
     } catch (requestError) {
       setError(requestError.message);
     }
   }, []);
+
+  useEffect(() => {
+    if (!authenticated || role !== "admin") return undefined;
+    const timer = window.setInterval(() => {
+      api("/api/renewal-requests").then(setRenewalRequests).catch((requestError) => setError(requestError.message));
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, [authenticated, role]);
 
   useEffect(() => {
     api("/api/session")
@@ -181,6 +200,42 @@ function App() {
     if (ok) setLoanForm({ ...loanForm, client_id: "", principal: "" });
   }
 
+  async function requestRenewal(loan) {
+    await submit(
+      () => api("/api/renewal-requests", {
+        method: "POST",
+        body: JSON.stringify({ source_loan_id: loan.id }),
+      }),
+      `Renewal request sent for ${loan.client_name}.`,
+    );
+  }
+
+  async function reviewRenewal(renewal, decision) {
+    await submit(
+      () => api(`/api/renewal-requests/${renewal.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ decision }),
+      }),
+      `Renewal request ${decision}.`,
+    );
+  }
+
+  async function saveRenewal(event) {
+    event.preventDefault();
+    const ok = await submit(
+      () => api("/api/loans", { method: "POST", body: JSON.stringify(renewalForm) }),
+      "Authorized renewal issued and added to the ledger.",
+    );
+    if (ok) setRenewalForm({
+      renewal_request_id: "",
+      loan_number: "",
+      principal: "",
+      total_due: "",
+      issued_on: "",
+      due_on: "",
+    });
+  }
+
   async function setAccount(client, status) {
     await submit(
       () =>
@@ -264,6 +319,10 @@ function App() {
   const nav = ["Overview", "Clients", "Ledgers", "Loans", "Payments", "Notifications"];
   if (role === "admin") nav.push("Staff");
   const demoLoans = loans.filter((loan) => loan.status === "active" && Number(loan.balance) > 0);
+  const pendingRenewal = role === "admin"
+    ? renewalRequests.find((renewal) => renewal.status === "pending")
+    : null;
+  const approvedRenewals = renewalRequests.filter((renewal) => renewal.status === "approved");
   const selectedDemoLoan = demoLoans.find(
     (loan) => String(loan.client_id) === demoPaymentForm.client_id,
   );
@@ -299,6 +358,23 @@ function App() {
         {error && <div className="alert error" role="alert">{error}<button onClick={() => setError("")}>×</button></div>}
         {success && <div className="alert success" role="status">{success}<button onClick={() => setSuccess("")}>×</button></div>}
 
+        {pendingRenewal && (
+          <div className="modal-backdrop" role="presentation">
+            <section className="renewal-modal" role="dialog" aria-modal="true" aria-labelledby="renewal-title">
+              <p className="eyebrow">RENEWAL APPROVAL</p>
+              <h2 id="renewal-title">{pendingRenewal.client_name} has cleared the loan</h2>
+              <p>
+                {pendingRenewal.requester_name} is requesting permission to renew loan{" "}
+                {pendingRenewal.source_loan_number} for {pendingRenewal.client_name}.
+              </p>
+              <div className="renewal-modal-actions">
+                <button className="secondary" onClick={() => reviewRenewal(pendingRenewal, "denied")}>Decline</button>
+                <button className="primary" onClick={() => reviewRenewal(pendingRenewal, "approved")}>Approve renewal</button>
+              </div>
+            </section>
+          </div>
+        )}
+
         {section === "Overview" && (
           <>
             <section className="stats-grid">
@@ -312,7 +388,7 @@ function App() {
             )}
             <div className="panel">
               <div className="panel-heading"><div><h2>Recent loans</h2><p>Latest activity across client accounts</p></div><button className="text-button" onClick={() => setSection("Loans")}>View all →</button></div>
-              <LoanTable rows={loans.slice(0, 5)} />
+              <LoanTable rows={loans.slice(0, 5)} canRequest={role === "staff"} renewalRequests={renewalRequests} onRequest={requestRenewal} />
             </div>
           </>
         )}
@@ -367,7 +443,7 @@ function App() {
 
         {section === "Loans" && (
           <div className="stack">
-            <form className="panel loan-form" onSubmit={saveLoan}>
+            {role === "admin" ? <form className="panel loan-form" onSubmit={saveLoan}>
               <div className="panel-heading"><div><h2>Issue a loan</h2><p>Total due = principal + flat interest. Repayments start the day after issue.</p></div></div>
               <div className="loan-fields">
                 <label>Client
@@ -387,8 +463,40 @@ function App() {
                 </label>
               </div>
               <button className="primary" type="submit">Issue loan</button>
-            </form>
-            <section className="panel"><div className="panel-heading"><div><h2>Loan ledger</h2><p>Principal, interest, payment balance, and due date</p></div></div><LoanTable rows={loans} /></section>
+            </form> : (
+              <div className="stack">
+                <form className="panel loan-form" onSubmit={saveRenewal}>
+                  <div className="panel-heading"><div><h2>Issue an approved renewal</h2><p>Only the loan number, amount issued, total repayment, issue date, and due date can be entered.</p></div></div>
+                  {approvedRenewals.length ? (
+                    <>
+                      <div className="loan-fields renewal-fields">
+                        <label>Approved client and request
+                          <select
+                            value={renewalForm.renewal_request_id}
+                            onChange={(event) => setRenewalForm({ ...renewalForm, renewal_request_id: event.target.value })}
+                            required
+                          >
+                            <option value="">Select an approved renewal</option>
+                            {approvedRenewals.map((renewal) => (
+                              <option key={renewal.id} value={renewal.id}>
+                                {renewal.client_name} · request #{renewal.id}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <Field label="Loan number" name="loan_number" value={renewalForm.loan_number} onChange={(event) => setRenewalForm({ ...renewalForm, loan_number: event.target.value })} required />
+                        <Field label="Amount issued (KES)" name="principal" type="number" min="0.01" step="0.01" value={renewalForm.principal} onChange={(event) => setRenewalForm({ ...renewalForm, principal: event.target.value })} required />
+                        <Field label="Total amount to be paid (KES)" name="total_due" type="number" min="0.01" step="0.01" value={renewalForm.total_due} onChange={(event) => setRenewalForm({ ...renewalForm, total_due: event.target.value })} required />
+                        <Field label="Date issued" name="issued_on" type="date" value={renewalForm.issued_on} onChange={(event) => setRenewalForm({ ...renewalForm, issued_on: event.target.value })} required />
+                        <Field label="Due date" name="due_on" type="date" value={renewalForm.due_on} onChange={(event) => setRenewalForm({ ...renewalForm, due_on: event.target.value })} required />
+                      </div>
+                      <button className="primary" type="submit">Issue renewal</button>
+                    </>
+                  ) : <p className="muted">No renewal request has been approved for your account.</p>}
+                </form>
+              </div>
+            )}
+            <section className="panel"><div className="panel-heading"><div><h2>Loan ledger</h2><p>Principal, interest, payment balance, and due date</p></div></div><LoanTable rows={loans} canRequest={role === "staff"} renewalRequests={renewalRequests} onRequest={requestRenewal} /></section>
           </div>
         )}
 
@@ -480,6 +588,15 @@ function App() {
                 ])}
                 empty="No staff accounts yet."
               />
+              <div className="panel-heading renewal-queue-heading"><div><h2>Renewal requests</h2><p>Requests from staff appear here and as an approval pop-up.</p></div></div>
+              <DataTable
+                headers={["Client", "Requested by", "Cleared loan", "Status"]}
+                rows={renewalRequests.map((renewal) => [
+                  renewal.client_name, renewal.requester_name, renewal.source_loan_number,
+                  <span className={`badge ${renewal.status}`}>{renewal.status}</span>,
+                ])}
+                empty="No staff renewal requests yet."
+              />
             </section>
             <form className="panel form-panel" onSubmit={saveStaff}>
               <div className="panel-heading"><div><h2>Add staff member</h2><p>New accounts receive standard staff access, not admin rights.</p></div></div>
@@ -527,14 +644,29 @@ function ClientTable({ rows, onToggle }) {
   );
 }
 
-function LoanTable({ rows }) {
-  return <DataTable headers={["Client", "Principal", "Interest", "Total due", "Paid", "Interest earned", "Principal balance", "Total balance", "Due date", "Status"]} rows={rows.map((loan) => [
+function LoanTable({ rows, canRequest = false, renewalRequests = [], onRequest }) {
+  const headers = ["Loan number", "Client", "Principal", "Interest", "Total due", "Paid", "Interest earned", "Principal balance", "Total balance", "Due date", "Status"];
+  if (canRequest) headers.push("Renewal");
+  return <DataTable headers={headers} rows={rows.map((loan) => {
+    const request = renewalRequests.find((item) => item.source_loan_id === loan.id);
+    const renewable = loan.status === "settled" && Number(loan.balance) === 0;
+    const row = [
+    loan.loan_number,
     <><strong>{loan.client_name}</strong><small>ID {loan.national_id}</small></>,
     money(loan.principal), money(loan.interest), money(loan.total_due),
     money(loan.paid), money(loan.interest_earned), money(loan.principal_balance),
     money(loan.balance), loan.due_on,
     <span className={`badge ${loan.status}`}>{loan.status}</span>,
-  ])} empty="No loans have been issued." />;
+    ];
+    if (canRequest) {
+      row.push(request && request.status !== "denied"
+        ? <span className={`badge ${request.status}`}>{request.status}</span>
+        : renewable
+          ? <button className="text-button small" onClick={() => onRequest(loan)}>Request renewal</button>
+          : <span className="muted">—</span>);
+    }
+    return row;
+  })} empty="No loans have been issued." />;
 }
 
 function DataTable({ headers, rows, empty }) {
@@ -615,6 +747,22 @@ function LedgerBrowser({ ledgers, selected, data, loading, onSelect }) {
                 )}
               </section>
             ))}
+            <section className="ledger-sheet app-ledger-activity">
+              <div className="panel-heading">
+                <div><h2>Nama Traders loan activity</h2><p>App-issued loans matched to this client by National ID. Original workbook remains unchanged.</p></div>
+                <span className="badge orange">APP RECORDS</span>
+              </div>
+              <DataTable
+                headers={["Loan number", "Amount issued", "Interest", "Total due", "Paid", "Balance", "Date issued", "Due date", "Status"]}
+                rows={(data.app_loans || []).map((loan) => [
+                  loan.loan_number, money(loan.principal), money(loan.interest),
+                  money(loan.total_due), money(loan.paid), money(loan.balance),
+                  loan.issued_on, loan.due_on,
+                  <span className={`badge ${loan.status}`}>{loan.status}</span>,
+                ])}
+                empty="No loans have been recorded in Nama Traders for this client."
+              />
+            </section>
             <section className="ledger-sheet app-ledger-activity">
               <div className="panel-heading">
                 <div><h2>Nama Traders payment activity</h2><p>App-recorded payments matched to this client by National ID. Original workbook remains unchanged.</p></div>

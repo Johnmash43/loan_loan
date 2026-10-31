@@ -125,6 +125,15 @@ td a { color: var(--orange-dark); text-decoration: none; font-weight: 600; }
 .alert.error { background: #fff0ed; color: #aa4538; }
 .alert.success { background: #eaf6ed; color: #38764a; }
 .alert.warning { background: #fff6e8; color: #94641d; }
+.modal-backdrop { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 20px; background: #29231f80; }
+.renewal-modal { width: min(100%, 450px); padding: 25px; border: 1px solid var(--line); border-radius: 13px; background: white; box-shadow: 0 20px 70px #21170f40; }
+.renewal-modal .eyebrow { margin-bottom: 8px; }
+.renewal-modal h2 { margin: 0 0 10px; font-size: 19px; }
+.renewal-modal p:not(.eyebrow) { color: #796f69; font-size: 12px; line-height: 1.6; }
+.renewal-modal-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 20px; }
+.secondary { border: 1px solid var(--line); border-radius: 7px; padding: 9px 14px; color: #655b55; background: white; font-size: 12px; font-weight: 700; }
+.renewal-queue-heading { margin: 27px 0 13px; }
+.renewal-fields { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .muted, .hint { color: var(--muted); }
 .login-page { min-height: 100vh; display: grid; place-items: center; padding: 20px; background: radial-gradient(circle at 15% 20%, #fff0e4, transparent 32%), #faf8f6; }
 .login-card { width: min(100%, 385px); padding: 34px; background: white; border: 1px solid var(--line); border-radius: 15px; box-shadow: 0 18px 55px #4b2d1710; }

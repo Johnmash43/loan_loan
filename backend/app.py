@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS clients (
 CREATE TABLE IF NOT EXISTS loans (
     id INTEGER PRIMARY KEY,
     client_id INTEGER NOT NULL REFERENCES clients(id),
+    loan_number TEXT NOT NULL DEFAULT '',
     principal_cents INTEGER NOT NULL CHECK(principal_cents > 0),
     interest_rate REAL NOT NULL CHECK(interest_rate >= 0),
     interest_cents INTEGER NOT NULL CHECK(interest_cents >= 0),
@@ -115,6 +116,17 @@ CREATE TABLE IF NOT EXISTS staff_users (
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS renewal_requests (
+    id INTEGER PRIMARY KEY,
+    client_id INTEGER NOT NULL REFERENCES clients(id),
+    source_loan_id INTEGER NOT NULL REFERENCES loans(id),
+    requested_by INTEGER NOT NULL REFERENCES staff_users(id),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'approved', 'denied', 'issued')),
+    created_at TEXT NOT NULL,
+    reviewed_at TEXT,
+    reviewed_by INTEGER REFERENCES staff_users(id)
+);
 """
 
 
@@ -151,6 +163,18 @@ def initialize_database():
             db.execute("ALTER TABLE clients ADD COLUMN form_filename TEXT NOT NULL DEFAULT ''")
         if "form_original_name" not in client_columns:
             db.execute("ALTER TABLE clients ADD COLUMN form_original_name TEXT NOT NULL DEFAULT ''")
+        loan_columns = {row["name"] for row in db.execute("PRAGMA table_info(loans)").fetchall()}
+        if "loan_number" not in loan_columns:
+            db.execute("ALTER TABLE loans ADD COLUMN loan_number TEXT NOT NULL DEFAULT ''")
+        db.execute(
+            "UPDATE loans SET loan_number = 'LN-' || printf('%06d', id) WHERE loan_number = ''"
+        )
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS loans_loan_number ON loans(loan_number)")
+        db.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS active_renewal_request_per_loan
+               ON renewal_requests(source_loan_id)
+               WHERE status IN ('pending', 'approved', 'issued')"""
+        )
         db.execute(
             """INSERT OR IGNORE INTO staff_users
                (username, full_name, password_hash, role, created_at)
@@ -355,7 +379,7 @@ def export_excel_ledger():
             "Client Name", "Client Phone", "Client National ID", "Business Type",
             "Business Location", "Residence Location", "Guarantor Name", "Guarantor Phone",
             "Guarantor National ID", "Guarantor Business Type", "Guarantor Business Location",
-            "Guarantor Residence Location", "Word Form", "Account Status", "Loan ID",
+            "Guarantor Residence Location", "Word Form", "Account Status", "Loan ID", "Loan Number",
             "Principal (KES)", "Interest (KES)", "Original Total Issued (KES)",
             "Total Amount Paid (KES)", "Remaining Balance (KES)", "Term (Days)",
             "Issue Date", "Due Date", "Loan Status",
@@ -372,7 +396,7 @@ def export_excel_ledger():
     )
     try:
         clients = db.execute(
-            """SELECT c.*, l.id AS loan_id, l.principal_cents, l.interest_cents,
+            """SELECT c.*, l.id AS loan_id, l.loan_number, l.principal_cents, l.interest_cents,
                       l.total_due_cents, l.term_days, l.issued_on, l.due_on, l.status AS loan_status,
                       COALESCE(p.total_paid, 0) AS total_paid
                FROM clients c
@@ -391,7 +415,7 @@ def export_excel_ledger():
                 row["guarantor_phone"], row["guarantor_national_id"],
                 row["guarantor_business_type"], row["guarantor_business_location"],
                 row["guarantor_residence_location"], row["form_original_name"],
-                row["account_status"], row["loan_id"],
+                row["account_status"], row["loan_id"], row["loan_number"],
                 row["principal_cents"] / 100 if has_loan else None,
                 row["interest_cents"] / 100 if has_loan else None,
                 row["total_due_cents"] / 100 if has_loan else None,
@@ -459,7 +483,7 @@ def export_excel_ledger():
             for cell in row[5:15]:
                 cell.number_format = '#,##0.00'
         for row in clients_sheet.iter_rows(min_row=2):
-            for cell in row[15:20]:
+            for cell in row[16:21]:
                 cell.number_format = '#,##0.00'
 
         EXCEL_LEDGER.parent.mkdir(parents=True, exist_ok=True)
@@ -624,12 +648,21 @@ def read_client_ledger(ledger_id):
                 None,
             )
             app_payments = []
+            app_loans = []
             if client_national_id:
                 db = get_db()
                 app_client = db.execute(
                     "SELECT id FROM clients WHERE national_id = ?", (client_national_id,)
                 ).fetchone()
                 if app_client:
+                    loan_rows = db.execute(
+                        """SELECT l.*, c.name AS client_name, c.national_id, c.phone,
+                                  c.account_status
+                           FROM loans l JOIN clients c ON c.id = l.client_id
+                           WHERE c.id = ? ORDER BY l.id DESC""",
+                        (app_client["id"],),
+                    ).fetchall()
+                    app_loans = [loan_row(db, loan) for loan in loan_rows]
                     payment_rows = db.execute(
                         """SELECT p.*, c.name AS client_name, c.national_id,
                                   l.principal_cents, l.total_due_cents,
@@ -650,6 +683,7 @@ def read_client_ledger(ledger_id):
                     "name": ledger["name"],
                     "location": ledger["location"],
                     "sheets": sheets,
+                    "app_loans": app_loans,
                     "app_payments": app_payments,
                 }
             )
@@ -996,10 +1030,193 @@ def loans():
     return jsonify([loan_row(db, row) for row in rows])
 
 
+@app.get("/api/renewal-requests")
+@staff_required
+def list_renewal_requests():
+    query = """SELECT r.*, c.name AS client_name, c.national_id,
+                      l.loan_number AS source_loan_number, l.total_due_cents AS source_total_due_cents,
+                      u.full_name AS requester_name
+               FROM renewal_requests r
+               JOIN clients c ON c.id = r.client_id
+               JOIN loans l ON l.id = r.source_loan_id
+               JOIN staff_users u ON u.id = r.requested_by"""
+    parameters = ()
+    if g.staff_user["role"] != "admin":
+        query += " WHERE r.requested_by = ?"
+        parameters = (g.staff_user["id"],)
+    query += " ORDER BY r.created_at DESC, r.id DESC"
+    rows = get_db().execute(query, parameters).fetchall()
+    return jsonify(
+        [
+            {
+                **dict(row),
+                "source_total_due": format_money(row["source_total_due_cents"]),
+            }
+            for row in rows
+        ]
+    )
+
+
+@app.post("/api/renewal-requests")
+@staff_required
+def create_renewal_request():
+    if g.staff_user["role"] != "staff":
+        return error("Only staff can request a loan renewal.", 403)
+    payload = request.get_json(silent=True) or {}
+    try:
+        source_loan_id = int(payload.get("source_loan_id", 0))
+    except (ValueError, TypeError):
+        return error("Choose a cleared loan to renew.")
+
+    db = get_db()
+    loan = db.execute(
+        """SELECT l.*, c.account_status,
+                  COALESCE(SUM(p.amount_cents), 0) AS total_paid
+           FROM loans l JOIN clients c ON c.id = l.client_id
+           LEFT JOIN payments p ON p.loan_id = l.id
+           WHERE l.id = ? GROUP BY l.id""",
+        (source_loan_id,),
+    ).fetchone()
+    if loan is None:
+        return error("Loan not found.", 404)
+    if loan["status"] != "settled" or loan["total_paid"] < loan["total_due_cents"]:
+        return error("A renewal can only be requested after the loan is fully paid.", 409)
+    if loan["account_status"] != "active":
+        return error("This client account is paused.", 409)
+    if db.execute(
+        "SELECT 1 FROM loans WHERE client_id = ? AND status = 'active'",
+        (loan["client_id"],),
+    ).fetchone():
+        return error("This client already has an active loan.", 409)
+    if db.execute(
+        """SELECT 1 FROM renewal_requests WHERE source_loan_id = ?
+           AND status IN ('pending', 'approved', 'issued')""",
+        (source_loan_id,),
+    ).fetchone():
+        return error("A renewal request already exists for this cleared loan.", 409)
+
+    try:
+        cursor = db.execute(
+            """INSERT INTO renewal_requests
+               (client_id, source_loan_id, requested_by, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (
+                loan["client_id"],
+                source_loan_id,
+                g.staff_user["id"],
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+    except sqlite3.IntegrityError:
+        db.rollback()
+        return error("A renewal request already exists for this cleared loan.", 409)
+    db.commit()
+    return jsonify({"id": cursor.lastrowid, "status": "pending"}), 201
+
+
+@app.patch("/api/renewal-requests/<int:request_id>")
+@admin_required
+def review_renewal_request(request_id):
+    payload = request.get_json(silent=True) or {}
+    decision = payload.get("decision")
+    if decision not in {"approved", "denied"}:
+        return error("Decision must be approved or denied.")
+    db = get_db()
+    cursor = db.execute(
+        """UPDATE renewal_requests
+           SET status = ?, reviewed_at = ?, reviewed_by = ?
+           WHERE id = ? AND status = 'pending'""",
+        (
+            decision,
+            datetime.now(timezone.utc).isoformat(),
+            g.staff_user["id"],
+            request_id,
+        ),
+    )
+    if cursor.rowcount == 0:
+        return error("Pending renewal request not found.", 404)
+    db.commit()
+    return jsonify({"id": request_id, "status": decision})
+
+
 @app.post("/api/loans")
 @staff_required
 def create_loan():
     payload = request.get_json(silent=True) or {}
+    db = get_db()
+    if g.staff_user["role"] == "staff":
+        try:
+            renewal_request_id = int(payload.get("renewal_request_id", 0))
+        except (ValueError, TypeError):
+            return error("Administrator approval is required before issuing a renewal.", 403)
+        renewal = db.execute(
+            """SELECT * FROM renewal_requests
+               WHERE id = ? AND requested_by = ? AND status = 'approved'""",
+            (renewal_request_id, g.staff_user["id"]),
+        ).fetchone()
+        if renewal is None:
+            return error("Administrator approval is required before issuing this renewal.", 403)
+        try:
+            loan_number = required_text(payload, "loan_number", "Loan number")
+            principal_cents = money_to_cents(payload.get("principal"))
+            total_due_cents = money_to_cents(payload.get("total_due"))
+            issued_on_text = required_text(payload, "issued_on", "Issue date")
+            due_on_text = required_text(payload, "due_on", "Due date")
+            issued_on = date.fromisoformat(issued_on_text)
+            due_on = date.fromisoformat(due_on_text)
+            if issued_on.isoformat() != issued_on_text or due_on.isoformat() != due_on_text:
+                raise ValueError("Dates must use YYYY-MM-DD format.")
+            if len(loan_number) > 40 or not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._/-]{0,39}", loan_number
+            ):
+                return error("Loan number must be 1–40 letters, numbers, dots, underscores, slashes or hyphens.")
+            if total_due_cents < principal_cents:
+                return error("Total amount to be paid cannot be less than the amount issued.")
+            term_days = (due_on - issued_on).days
+            if term_days not in range(25, 31):
+                return error("The due date must be 25–30 days after the issue date.")
+        except (ValueError, TypeError):
+            return error("Enter a valid authorized renewal, amount, loan number, and dates.")
+
+        client = db.execute(
+            "SELECT * FROM clients WHERE id = ?", (renewal["client_id"],)
+        ).fetchone()
+        if client is None or client["account_status"] != "active":
+            return error("This client account is not available for a renewal.", 409)
+        if db.execute(
+            "SELECT 1 FROM loans WHERE client_id = ? AND status = 'active'",
+            (renewal["client_id"],),
+        ).fetchone():
+            return error("This client already has an active loan.", 409)
+        interest_cents = total_due_cents - principal_cents
+        interest_rate = float(Decimal(interest_cents) * 100 / Decimal(principal_cents))
+        try:
+            cursor = db.execute(
+                """INSERT INTO loans
+                   (client_id, loan_number, principal_cents, interest_rate, interest_cents,
+                    total_due_cents, term_days, issued_on, due_on, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    client["id"], loan_number, principal_cents, interest_rate, interest_cents,
+                    total_due_cents, term_days, issued_on_text, due_on_text,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            db.execute(
+                "UPDATE renewal_requests SET status = 'issued' WHERE id = ?",
+                (renewal_request_id,),
+            )
+            db.commit()
+        except sqlite3.IntegrityError:
+            db.rollback()
+            return error("That loan number is already in use.", 409)
+        try:
+            export_excel_ledger()
+        except (OSError, sqlite3.Error) as exc:
+            app.logger.exception("Excel ledger update failed after renewal issue")
+            return error(f"Renewal was saved, but the Excel ledger could not be updated: {exc}", 500)
+        return jsonify({"id": cursor.lastrowid, "total_due": format_money(total_due_cents)}), 201
+
     try:
         client_id = int(payload.get("client_id", 0))
         principal_cents = money_to_cents(payload.get("principal"))
@@ -1012,7 +1229,6 @@ def create_loan():
     except (ValueError, InvalidOperation, TypeError):
         return error("Enter a valid client, principal, interest rate, and term.")
 
-    db = get_db()
     client = db.execute("SELECT * FROM clients WHERE id = ?", (client_id,)).fetchone()
     if client is None:
         return error("Client not found.", 404)
@@ -1033,11 +1249,12 @@ def create_loan():
     issued_on = date.today()
     cursor = db.execute(
         """INSERT INTO loans
-           (client_id, principal_cents, interest_rate, interest_cents, total_due_cents,
+           (client_id, loan_number, principal_cents, interest_rate, interest_cents, total_due_cents,
             term_days, issued_on, due_on, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             client_id,
+            f"TEMP-{uuid.uuid4().hex}",
             principal_cents,
             float(interest_rate),
             interest_cents,
@@ -1048,6 +1265,8 @@ def create_loan():
             datetime.now(timezone.utc).isoformat(),
         ),
     )
+    loan_number = f"LN-{cursor.lastrowid:06d}"
+    db.execute("UPDATE loans SET loan_number = ? WHERE id = ?", (loan_number, cursor.lastrowid))
     db.commit()
     try:
         export_excel_ledger()

@@ -7,6 +7,7 @@ A small staff-facing loan ledger built with a React/JavaScript frontend, a Pytho
 ## Features
 
 - Administrator and staff sign-in. Administrators can create staff accounts; staff accounts cannot create other accounts or administer the system.
+- Staff cannot issue loans without administrator approval. After a loan is fully paid, staff can request a renewal; the administrator receives an in-app approval pop-up, and approval grants that staff member one renewal with access only to its loan number, issued amount, total repayment, issue date, and due date.
 - Client and guarantor registration, with client and guarantor phone numbers and an optional `.docx` registration-form upload.
 - Loan ledger with principal, flat interest, total repayment, term, amount paid, balance, and final due date.
 - Repayment starts on the calendar day after issue. The selected term is 25–30 days; total repayment is principal plus flat interest, distributed evenly as a daily installment estimate.

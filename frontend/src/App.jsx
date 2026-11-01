@@ -1,5 +1,20 @@
 import { useCallback, useEffect, useState } from "react";
 
+const SECTION_ROUTES = {
+  Overview: "/overview",
+  Clients: "/clients",
+  Ledgers: "/ledgers",
+  Loans: "/loans",
+  Payments: "/payments",
+  Notifications: "/notifications",
+  Staff: "/staff",
+};
+
+function sectionForPath(pathname) {
+  const path = pathname.replace(/\/+$/, "").toLowerCase() || "/";
+  return Object.entries(SECTION_ROUTES).find(([, route]) => route === path)?.[0] || "Overview";
+}
+
 const blankClient = {
   name: "",
   phone: "",
@@ -41,7 +56,7 @@ function App() {
   const [sessionUserId, setSessionUserId] = useState(null);
   const [role, setRole] = useState("");
   const [loading, setLoading] = useState(true);
-  const [section, setSection] = useState("Overview");
+  const [section, setSection] = useState(() => sectionForPath(window.location.pathname));
   const [clientScope, setClientScope] = useState("mine");
   const [dashboard, setDashboard] = useState(null);
   const [clients, setClients] = useState([]);
@@ -78,6 +93,27 @@ function App() {
     issued_on: "",
     due_on: "",
   });
+
+  useEffect(() => {
+    function syncSectionFromUrl() {
+      setSection(sectionForPath(window.location.pathname));
+    }
+    window.addEventListener("popstate", syncSectionFromUrl);
+    return () => window.removeEventListener("popstate", syncSectionFromUrl);
+  }, []);
+
+  useEffect(() => {
+    if (loading) return;
+    const requestedSection = sectionForPath(window.location.pathname);
+    const targetSection = requestedSection === "Staff" && role !== "admin"
+      ? "Overview"
+      : requestedSection;
+    const targetPath = SECTION_ROUTES[targetSection];
+    if (window.location.pathname !== targetPath) {
+      window.history.replaceState({}, "", targetPath);
+    }
+    if (targetSection !== section) setSection(targetSection);
+  }, [loading, role, section]);
 
   const loadData = useCallback(async () => {
     try {
@@ -358,6 +394,14 @@ function App() {
   const selectedDemoLoan = demoLoans.find(
     (loan) => String(loan.client_id) === demoPaymentForm.client_id,
   );
+  function navigateToSection(targetSection) {
+    const targetPath = SECTION_ROUTES[targetSection];
+    if (!targetPath || (targetSection === "Staff" && role !== "admin")) return;
+    if (window.location.pathname !== targetPath) {
+      window.history.pushState({}, "", targetPath);
+    }
+    setSection(targetSection);
+  }
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -370,7 +414,7 @@ function App() {
               key={item}
               title={item}
               aria-label={item}
-              onClick={() => setSection(item)}
+              onClick={() => navigateToSection(item)}
             >
               <span className="nav-dot" />{item}
             </button>
@@ -415,11 +459,51 @@ function App() {
               <Stat label={role === "staff" ? "My payments today" : "Outstanding balance"} value={role === "staff" ? money(dashboard?.my_paid_today) : money(dashboard?.outstanding)} icon="03" />
               <Stat label={role === "staff" ? "Company payments today" : "Overdue loans"} value={role === "staff" ? money(dashboard?.company_paid_today) : dashboard?.overdue_loans ?? 0} icon="04" />
             </section>
+            {role === "admin" && dashboard?.location_summaries && (
+              <section className="panel location-panel">
+                <div className="panel-heading">
+                  <div>
+                    <h2>Location portfolio</h2>
+                    <p>Outstanding balances and payments recovered under the 25% interest rule</p>
+                  </div>
+                </div>
+                <div className="location-total">
+                  <h3>All locations <span>{dashboard.overall_location_summary?.clients ?? 0} clients</span></h3>
+                  <div className="location-total-metrics">
+                    <div><span>Outstanding</span><strong>{money(dashboard.overall_location_summary?.outstanding)}</strong></div>
+                    <div><span>Total recovered</span><strong>{money(dashboard.overall_location_summary?.recovered)}</strong></div>
+                    <div><span>Principal recovered</span><strong>{money(dashboard.overall_location_summary?.principal_recovered)}</strong></div>
+                    <div><span>25% interest recovered</span><strong>{money(dashboard.overall_location_summary?.interest_recovered)}</strong></div>
+                  </div>
+                </div>
+                <div className="location-summary-grid">
+                  {dashboard.location_summaries.map((item) => (
+                    <article className="location-summary-card" key={item.location}>
+                      <h3>{item.location}</h3>
+                      <p>{item.clients} {item.clients === 1 ? "client" : "clients"}</p>
+                      <div className="location-metric">
+                        <span>Outstanding balance</span>
+                        <strong>{money(item.outstanding)}</strong>
+                      </div>
+                      <div className="location-metric">
+                        <span>Total recovered</span>
+                        <strong>{money(item.recovered)}</strong>
+                      </div>
+                      <div className="location-recovery-split">
+                        <span>Principal: {money(item.principal_recovered)}</span>
+                        <span>Interest: {money(item.interest_recovered)}</span>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+                <p className="location-rule-note">For loans with 25% interest, recovered payments are allocated proportionally between principal and interest.</p>
+              </section>
+            )}
             {dashboard?.failed_notifications > 0 && (
               <div className="alert warning">{dashboard.failed_notifications} notification delivery/deliveries failed. Check the Notifications tab and webhook configuration.</div>
             )}
             <div className="panel">
-              <div className="panel-heading"><div><h2>Recent loans</h2><p>Latest activity across client accounts</p></div><button className="text-button" onClick={() => setSection("Loans")}>View all →</button></div>
+              <div className="panel-heading"><div><h2>Recent loans</h2><p>Latest activity across client accounts</p></div><button className="text-button" onClick={() => navigateToSection("Loans")}>View all →</button></div>
               <LoanTable rows={loans.slice(0, 5)} canRequest={role === "staff"} renewalRequests={renewalRequests} onRequest={requestRenewal} />
             </div>
           </>

@@ -45,6 +45,16 @@ LOCATION_ALIASES = {
     "KIHINGO": "KIHINGO & STOO",
     "STOO": "KIHINGO & STOO",
 }
+DASHBOARD_LOCATIONS = (
+    "NJORO",
+    "PIAVE NJORO",
+    "ELBURGON & MOLO",
+    "MAILI TATU",
+    "EGERTON",
+    "EGERTON 2",
+    "KIHINGO & STOO",
+    "NJOKERIO",
+)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "local-development-key-change-me")
@@ -192,6 +202,8 @@ def location_for_business_address(value):
         return "ELBURGON & MOLO"
     if "kihingo" in normalized or "stoo" in normalized:
         return "KIHINGO & STOO"
+    if "njokerio" in normalized:
+        return "NJOKERIO"
     return None
 
 
@@ -1195,6 +1207,82 @@ def dashboard():
            WHERE date(p.paid_at) = ?""",
         (today,),
     ).fetchone()[0]
+    location_summaries = {}
+    if g.staff_user["role"] == "admin":
+        location_summaries = {
+            location: {
+                "location": location,
+                "client_ids": set(),
+                "outstanding": 0,
+                "recovered": 0,
+                "principal_recovered": 0,
+                "interest_recovered": 0,
+            }
+            for location in DASHBOARD_LOCATIONS
+        }
+        all_client_ids = set()
+        overall_totals = {
+            "outstanding": 0,
+            "recovered": 0,
+            "principal_recovered": 0,
+            "interest_recovered": 0,
+        }
+        location_rows = db.execute(
+            """SELECT c.id AS client_id, c.business_location,
+                      l.principal_cents, l.total_due_cents,
+                      COALESCE(SUM(p.amount_cents), 0) AS paid_cents
+               FROM clients c
+               LEFT JOIN loans l ON l.client_id = c.id
+               LEFT JOIN payments p ON p.loan_id = l.id
+               GROUP BY c.id, l.id"""
+        ).fetchall()
+        for row in location_rows:
+            location = location_for_business_address(row["business_location"])
+            canonical_location = next(
+                (item for item in DASHBOARD_LOCATIONS
+                 if location is not None
+                 and normalize_location(item) == normalize_location(location)),
+                None,
+            )
+            if canonical_location is None:
+                summary_row = None
+            else:
+                summary_row = location_summaries[canonical_location]
+                summary_row["client_ids"].add(row["client_id"])
+            all_client_ids.add(row["client_id"])
+            if row["total_due_cents"] is None:
+                continue
+            principal_cents = row["principal_cents"]
+            total_due_cents = row["total_due_cents"]
+            paid_cents = min(max(row["paid_cents"], 0), total_due_cents)
+            principal_recovered_cents = allocated_principal_cents(
+                principal_cents, total_due_cents, paid_cents
+            )
+            loan_totals = {
+                "outstanding": max(0, total_due_cents - row["paid_cents"]),
+                "recovered": paid_cents,
+                "principal_recovered": principal_recovered_cents,
+                "interest_recovered": paid_cents - principal_recovered_cents,
+            }
+            for field, amount in loan_totals.items():
+                overall_totals[field] += amount
+                if summary_row is not None:
+                    summary_row[field] += amount
+
+        location_summaries = list(location_summaries.values())
+        for summary_row in location_summaries:
+            summary_row["clients"] = len(summary_row.pop("client_ids"))
+            for field in ("outstanding", "recovered", "principal_recovered", "interest_recovered"):
+                summary_row[field] = format_money(summary_row[field])
+
+        overall_location_summary = {
+            "location": "All locations",
+            "clients": len(all_client_ids),
+            **{
+                field: format_money(amount)
+                for field, amount in overall_totals.items()
+            },
+        }
     selected_count = summary["my_client_count"] if scope == "mine" and g.staff_user["role"] == "staff" else summary["company_client_count"]
     selected_outstanding = summary["my_outstanding_cents"] if scope == "mine" and g.staff_user["role"] == "staff" else summary["company_outstanding_cents"]
     selected_failed = summary["my_failed_notifications"] if scope == "mine" and g.staff_user["role"] == "staff" else summary["company_failed_notifications"]
@@ -1210,6 +1298,14 @@ def dashboard():
             "my_paid_today": format_money(my_paid_today),
             "company_paid_today": format_money(company_paid_today),
             "scope": scope,
+            **(
+                {
+                    "location_summaries": location_summaries,
+                    "overall_location_summary": overall_location_summary,
+                }
+                if g.staff_user["role"] == "admin"
+                else {}
+            ),
         }
     )
 

@@ -18,6 +18,7 @@ A small staff-facing loan ledger built with a React/JavaScript frontend, a Pytho
 - Staff can pause and reopen a client's account. A paused account cannot receive a new loan. Clients with an active loan cannot receive another.
 - A daily command creates the late-payment reminder on day 25 when a balance remains.
 - Notification history records pending, sent, and failed deliveries.
+- The Notifications tab builds date-based payment reports from the client workbooks. Staff see their assigned locations and a company-wide list; administrators see all locations grouped separately.
 
 ## Requirements
 
@@ -66,6 +67,8 @@ After a client is registered, a loan is issued, or an M-Pesa payment is recorded
 - **Payment History**: one row per Paybill transaction, including principal and interest, original total issued, transaction payment, cumulative paid, remaining balance, weekday, date, month, year, and time.
 
 The **Ledgers** page reads client workbooks directly from `CLIENT_LEDGER_DIRECTORY` (default: `~/MASH/LEDGERS`). Set this variable to the folder containing the existing client ledger directories. Workbooks are opened read-only and displayed in the app; temporary Excel lock files are excluded. Set `EXCEL_LEDGER_PATH` and `FORMS_DIRECTORY` to change the generated workbook and form locations. SQLite remains the source of truth for app-managed client and payment data.
+
+Daily payment reports use the subfolder name as the location and refresh changed workbooks when opened. The configured locations are: Staff1 (NJORO, PIAVE NJORO), Staff2 (ELBURGON & MOLO, MAILI TATU), and Staff3 (EGERTON, EGERTON 2, KIHINGO & STOO). Locations without a staff assignment remain visible to administrators.
 
 ## M-Pesa and notifications
 

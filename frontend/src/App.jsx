@@ -13,6 +13,7 @@ const blankClient = {
   guarantor_business_type: "",
   guarantor_business_location: "",
   guarantor_residence_location: "",
+  assigned_staff_id: "",
 };
 
 async function api(path, options = {}) {
@@ -37,14 +38,19 @@ function money(value) {
 
 function App() {
   const [authenticated, setAuthenticated] = useState(false);
+  const [sessionUserId, setSessionUserId] = useState(null);
   const [role, setRole] = useState("");
   const [loading, setLoading] = useState(true);
   const [section, setSection] = useState("Overview");
+  const [clientScope, setClientScope] = useState("mine");
   const [dashboard, setDashboard] = useState(null);
   const [clients, setClients] = useState([]);
   const [loans, setLoans] = useState([]);
   const [payments, setPayments] = useState([]);
   const [notifications, setNotifications] = useState([]);
+  const [dailyLedgerReportDate, setDailyLedgerReportDate] = useState("2026-10-01");
+  const [dailyLedgerReport, setDailyLedgerReport] = useState(null);
+  const [dailyLedgerLoading, setDailyLedgerLoading] = useState(false);
   const [renewalRequests, setRenewalRequests] = useState([]);
   const [staff, setStaff] = useState([]);
   const [ledgerFiles, setLedgerFiles] = useState([]);
@@ -75,9 +81,10 @@ function App() {
 
   const loadData = useCallback(async () => {
     try {
+      const scope = role === "staff" ? clientScope : "company";
       const [stats, clientRows, loanRows, paymentRows, notificationRows, renewals] = await Promise.all([
-        api("/api/dashboard"),
-        api("/api/clients"),
+        api(`/api/dashboard?scope=${scope}`),
+        api(`/api/clients?scope=${scope}`),
         api("/api/loans"),
         api("/api/payments"),
         api("/api/notifications"),
@@ -92,7 +99,7 @@ function App() {
     } catch (requestError) {
       setError(requestError.message);
     }
-  }, []);
+  }, [clientScope, role]);
 
   useEffect(() => {
     if (!authenticated || role !== "admin") return undefined;
@@ -104,15 +111,25 @@ function App() {
 
   useEffect(() => {
     api("/api/session")
-      .then(({ authenticated: isAuthenticated, role: currentRole }) => {
+      .then(({ authenticated: isAuthenticated, id, role: currentRole }) => {
         setAuthenticated(isAuthenticated);
+        setSessionUserId(id || null);
         setRole(currentRole || "");
-        if (isAuthenticated) return loadData();
+        if (currentRole === "staff") setClientScope("mine");
+        else setClientScope("company");
         return undefined;
       })
       .catch((requestError) => setError(requestError.message))
       .finally(() => setLoading(false));
   }, [loadData]);
+
+  useEffect(() => {
+    if (!authenticated || !role) return undefined;
+    if (role === "staff") setClientScope((current) => current || "mine");
+    else setClientScope("company");
+    loadData();
+    return undefined;
+  }, [authenticated, role, clientScope, loadData]);
 
   useEffect(() => {
     if (authenticated && role === "admin") {
@@ -125,6 +142,16 @@ function App() {
       api("/api/client-ledgers").then(setLedgerFiles).catch((requestError) => setError(requestError.message));
     }
   }, [authenticated, section]);
+
+  useEffect(() => {
+    if (!authenticated || section !== "Notifications") return undefined;
+    setDailyLedgerLoading(true);
+    api(`/api/ledger/daily-payments?date=${dailyLedgerReportDate}`)
+      .then(setDailyLedgerReport)
+      .catch((requestError) => setError(requestError.message))
+      .finally(() => setDailyLedgerLoading(false));
+    return undefined;
+  }, [authenticated, section, dailyLedgerReportDate]);
 
   useEffect(() => {
     if (authenticated) {
@@ -160,6 +187,7 @@ function App() {
             password: form.get("password"),
           }),
         });
+        setSessionUserId(account.id || null);
         setRole(account.role);
         setAuthenticated(true);
       },
@@ -172,6 +200,7 @@ function App() {
     await submit(async () => {
       await api("/api/logout", { method: "POST" });
       setAuthenticated(false);
+      setSessionUserId(null);
       setRole("");
     }, "You have been signed out.");
   }
@@ -179,7 +208,10 @@ function App() {
   async function saveClient(event) {
     event.preventDefault();
     const body = new FormData();
-    Object.entries(clientForm).forEach(([key, value]) => body.append(key, value));
+    Object.entries(clientForm).forEach(([key, value]) => {
+      if (value !== "" && value != null) body.append(key, value);
+    });
+    if (role === "staff" && !body.has("assigned_staff_id")) body.append("assigned_staff_id", String(sessionUserId || ""));
     if (formFile) body.append("form_file", formFile);
     const ok = await submit(
       () => api("/api/clients", { method: "POST", body }),
@@ -378,10 +410,10 @@ function App() {
         {section === "Overview" && (
           <>
             <section className="stats-grid">
-              <Stat label="Registered clients" value={dashboard?.clients ?? 0} icon="01" />
-              <Stat label="Active loans" value={dashboard?.active_loans ?? 0} icon="02" />
-              <Stat label="Outstanding balance" value={money(dashboard?.outstanding)} icon="03" />
-              <Stat label="Overdue loans" value={dashboard?.overdue_loans ?? 0} icon="04" />
+              <Stat label={role === "staff" ? "My clients" : "Registered clients"} value={role === "staff" ? dashboard?.my_clients ?? 0 : dashboard?.clients ?? 0} icon="01" />
+              <Stat label={role === "staff" ? "Company clients" : "Active loans"} value={role === "staff" ? dashboard?.company_clients ?? 0 : dashboard?.active_loans ?? 0} icon="02" />
+              <Stat label={role === "staff" ? "My payments today" : "Outstanding balance"} value={role === "staff" ? money(dashboard?.my_paid_today) : money(dashboard?.outstanding)} icon="03" />
+              <Stat label={role === "staff" ? "Company payments today" : "Overdue loans"} value={role === "staff" ? money(dashboard?.company_paid_today) : dashboard?.overdue_loans ?? 0} icon="04" />
             </section>
             {dashboard?.failed_notifications > 0 && (
               <div className="alert warning">{dashboard.failed_notifications} notification delivery/deliveries failed. Check the Notifications tab and webhook configuration.</div>
@@ -395,6 +427,12 @@ function App() {
 
         {section === "Clients" && (
           <div className="content-grid">
+            {role === "staff" && (
+              <div className="panel scope-toggle-row">
+                <button className={clientScope === "mine" ? "primary" : "secondary"} onClick={() => setClientScope("mine")}>My clients</button>
+                <button className={clientScope === "company" ? "primary" : "secondary"} onClick={() => setClientScope("company")}>Company clients</button>
+              </div>
+            )}
             <section className="panel">
               <div className="panel-heading"><div><h2>Client register</h2><p>Clients, guarantors and generated forms</p></div></div>
               <ClientTable rows={clients} onToggle={setAccount} />
@@ -403,6 +441,21 @@ function App() {
               <div className="panel-heading"><div><h2>Register a client</h2><p>Enter client and guarantor details</p></div></div>
               <div className="form-section">CLIENT DETAILS</div>
               <div className="form-grid">
+                {role === "admin" && (
+                  <label>
+                    Assign to staff
+                    <select
+                      value={clientForm.assigned_staff_id}
+                      onChange={(event) => setClientForm({ ...clientForm, assigned_staff_id: event.target.value })}
+                    >
+                      <option value="">Assign automatically by location</option>
+                      <option value="unassigned">Leave unassigned</option>
+                      {staff.filter((member) => member.active && member.role === "staff").map((member) => (
+                        <option key={member.id} value={member.id}>{member.full_name}</option>
+                      ))}
+                    </select>
+                  </label>
+                )}
                 <Field label="Full name" name="name" value={clientForm.name} onChange={updateClient(setClientForm)} required />
                 <Field label="Phone number" name="phone" value={clientForm.phone} onChange={updateClient(setClientForm)} placeholder="+254…" required />
                 <Field label="National ID" name="national_id" value={clientForm.national_id} onChange={updateClient(setClientForm)} required />
@@ -434,6 +487,7 @@ function App() {
         {section === "Ledgers" && (
           <LedgerBrowser
             ledgers={ledgerFiles}
+            role={role}
             selected={selectedLedger}
             data={ledgerData}
             loading={ledgerLoading}
@@ -568,11 +622,49 @@ function App() {
         )}
 
         {section === "Notifications" && (
-          <section className="panel">
-            <div className="panel-heading"><div><h2>Notification log</h2><p>Payment receipts, balances, due dates, and late reminders</p></div></div>
-            <DataTable headers={["Client", "Message", "Status", "Created"]} rows={notifications.map((row) => [row.client_name, row.message, <span className={`badge ${row.status}`}>{row.status}{row.error ? `: ${row.error}` : ""}</span>, row.created_at])} />
-            {!notifications.length && <Empty text="Notifications will appear here when generated." />}
-          </section>
+          <div className="stack">
+            <section className="panel">
+              <div className="panel-heading">
+                <div><h2>Daily ledger payments</h2><p>Payment entries recorded in the client workbooks, grouped by location.</p></div>
+                <label>Report date
+                  <input
+                    type="date"
+                    value={dailyLedgerReportDate}
+                    onChange={(event) => setDailyLedgerReportDate(event.target.value)}
+                  />
+                </label>
+              </div>
+              {dailyLedgerReport?.unreadable_workbooks > 0 && (
+                <div className="alert warning">
+                  {dailyLedgerReport.unreadable_workbooks} workbook(s) could not be read
+                  ({Object.entries(dailyLedgerReport.unreadable_by_location || {}).map(([location, count]) => `${location}: ${count}`).join(", ")}).
+                  Their entries may be missing from this report.
+                </div>
+              )}
+              {dailyLedgerLoading && <div className="loading-inline">Refreshing payment rows from the ledgers…</div>}
+              {!dailyLedgerLoading && dailyLedgerReport && (
+                role === "admin" ? (
+                  <DailyPaymentGroups rows={dailyLedgerReport.all_payments} empty="No ledger payments were recorded on this date." />
+                ) : (
+                  <>
+                    <section className="daily-report-section">
+                      <div className="panel-heading"><div><h2>My location payments</h2><p>{dailyLedgerReport.my_locations.join(", ") || "No locations assigned"}</p></div></div>
+                      <DailyPaymentGroups rows={dailyLedgerReport.my_payments} empty="No payments were recorded for your locations on this date." />
+                    </section>
+                    <section className="daily-report-section">
+                      <div className="panel-heading"><div><h2>Overall staff payments</h2><p>All staff locations, grouped by location</p></div></div>
+                      <DailyPaymentGroups rows={dailyLedgerReport.all_payments} empty="No ledger payments were recorded on this date." />
+                    </section>
+                  </>
+                )
+              )}
+            </section>
+            <section className="panel">
+              <div className="panel-heading"><div><h2>Notification log</h2><p>Payment receipts, balances, due dates, and late reminders</p></div></div>
+              <DataTable headers={["Client", "Message", "Status", "Created"]} rows={notifications.map((row) => [row.client_name, row.message, <span className={`badge ${row.status}`}>{row.status}{row.error ? `: ${row.error}` : ""}</span>, row.created_at])} />
+              {!notifications.length && <Empty text="Notifications will appear here when generated." />}
+            </section>
+          </div>
         )}
 
         {section === "Staff" && role === "admin" && (
@@ -629,10 +721,11 @@ function Stat({ label, value, icon }) {
 function ClientTable({ rows, onToggle }) {
   if (!rows.length) return <Empty text="No clients registered yet." />;
   return (
-    <div className="table-wrap"><table><thead><tr><th>Client</th><th>National ID</th><th>Phone</th><th>Principal Balance</th><th>Total Balance</th><th>Interest Earned</th><th>Form</th><th>Account</th><th>Action</th></tr></thead>
+    <div className="table-wrap"><table><thead><tr><th>Client</th><th>National ID</th><th>Phone</th><th>Assigned to</th><th>Principal Balance</th><th>Total Balance</th><th>Interest Earned</th><th>Form</th><th>Account</th><th>Action</th></tr></thead>
       <tbody>{rows.map((client) => <tr key={client.id}>
         <td><strong>{client.name}</strong><small>{client.business_type}</small></td>
         <td>{client.national_id}</td><td>{client.phone}</td>
+        <td>{client.assigned_staff_name || "Unassigned"}</td>
         <td>{client.active_loan_id ? money(client.active_principal_balance) : "—"}</td>
         <td>{client.active_loan_id ? money(client.active_total_balance) : "—"}</td>
         <td>{client.active_loan_id ? money(client.active_interest_earned) : "—"}</td>
@@ -680,7 +773,34 @@ function Empty({ text }) {
   return <div className="empty"><span>◌</span><p>{text}</p></div>;
 }
 
-function LedgerBrowser({ ledgers, selected, data, loading, onSelect }) {
+function DailyPaymentGroups({ rows, empty }) {
+  if (!rows.length) return <Empty text={empty} />;
+  const groups = rows.reduce((result, payment) => {
+    result[payment.location] = result[payment.location] || [];
+    result[payment.location].push(payment);
+    return result;
+  }, {});
+  return Object.entries(groups).map(([location, paymentsInLocation]) => (
+    <section className="daily-report-section" key={location}>
+      <div className="panel-heading">
+        <div>
+          <h2>{location}</h2>
+          <p>{paymentsInLocation.length} payment{paymentsInLocation.length === 1 ? "" : "s"} · {money(paymentsInLocation.reduce((sum, payment) => sum + Number(payment.amount), 0))} received</p>
+        </div>
+      </div>
+      <DataTable
+        headers={["Client", "Amount paid", "Balance"]}
+        rows={paymentsInLocation.map((payment) => [
+          payment.client_name,
+          money(payment.amount),
+          payment.balance == null ? "—" : money(payment.balance),
+        ])}
+      />
+    </section>
+  ));
+}
+
+function LedgerBrowser({ ledgers, role, selected, data, loading, onSelect }) {
   const [query, setQuery] = useState("");
   const visibleLedgers = ledgers.filter((ledger) =>
     `${ledger.name} ${ledger.location}`.toLowerCase().includes(query.trim().toLowerCase()),
@@ -688,7 +808,7 @@ function LedgerBrowser({ ledgers, selected, data, loading, onSelect }) {
   return (
     <div className="ledger-browser">
       <section className="panel ledger-list">
-        <div className="panel-heading"><div><h2>Client ledgers</h2><p>{ledgers.length} workbooks available</p></div></div>
+        <div className="panel-heading"><div><h2>{role === "admin" ? "Company ledgers" : "Your location ledgers"}</h2><p>{ledgers.length} workbooks available</p></div></div>
         <label className="ledger-search">
           Search by client
           <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Enter client name…" />

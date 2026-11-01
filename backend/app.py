@@ -34,6 +34,17 @@ STAFF_USERNAME = os.environ.get("STAFF_USERNAME", "admin")
 STAFF_PASSWORD = os.environ.get("STAFF_PASSWORD", "admin123")
 WEBHOOK_URL = os.environ.get("NOTIFICATION_WEBHOOK_URL", "")
 WEBHOOK_TOKEN = os.environ.get("NOTIFICATION_WEBHOOK_TOKEN", "")
+STAFF_LOCATION_MAP = {
+    "staff1": ("NJORO", "PIAVE NJORO"),
+    "staff2": ("ELBURGON & MOLO", "MAILI TATU"),
+    "staff3": ("EGERTON", "EGERTON  2", "KIHINGO & STOO"),
+}
+LOCATION_ALIASES = {
+    "ELBURGON": "ELBURGON & MOLO",
+    "MOLO": "ELBURGON & MOLO",
+    "KIHINGO": "KIHINGO & STOO",
+    "STOO": "KIHINGO & STOO",
+}
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "local-development-key-change-me")
@@ -68,6 +79,7 @@ CREATE TABLE IF NOT EXISTS clients (
     guarantor_residence_location TEXT NOT NULL,
     form_filename TEXT NOT NULL DEFAULT '',
     form_original_name TEXT NOT NULL DEFAULT '',
+    assigned_staff_id INTEGER REFERENCES staff_users(id),
     account_status TEXT NOT NULL DEFAULT 'active' CHECK(account_status IN ('active', 'paused')),
     account_note TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
@@ -116,6 +128,30 @@ CREATE TABLE IF NOT EXISTS staff_users (
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS staff_locations (
+    staff_id INTEGER NOT NULL REFERENCES staff_users(id),
+    location TEXT NOT NULL,
+    PRIMARY KEY (staff_id, location),
+    UNIQUE (location)
+);
+CREATE TABLE IF NOT EXISTS ledger_report_scans (
+    report_date TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    modified_ns INTEGER NOT NULL,
+    file_size INTEGER NOT NULL,
+    error TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (report_date, source_path)
+);
+CREATE TABLE IF NOT EXISTS ledger_report_payments (
+    report_date TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    source_row INTEGER NOT NULL,
+    location TEXT NOT NULL,
+    client_name TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    balance_cents INTEGER,
+    PRIMARY KEY (report_date, source_path, source_row)
+);
 CREATE TABLE IF NOT EXISTS renewal_requests (
     id INTEGER PRIMARY KEY,
     client_id INTEGER NOT NULL REFERENCES clients(id),
@@ -128,6 +164,45 @@ CREATE TABLE IF NOT EXISTS renewal_requests (
     reviewed_by INTEGER REFERENCES staff_users(id)
 );
 """
+
+
+def normalize_location(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def location_for_business_address(value):
+    normalized = normalize_location(value)
+    if normalized in {normalize_location(key) for key in LOCATION_ALIASES}:
+        return LOCATION_ALIASES[next(
+            key for key in LOCATION_ALIASES
+            if normalize_location(key) == normalized
+        )]
+    candidates = sorted(
+        (location for locations in STAFF_LOCATION_MAP.values() for location in locations),
+        key=len,
+        reverse=True,
+    )
+    for location in candidates:
+        location_normalized = normalize_location(location)
+        if normalized == location_normalized or location_normalized in normalized:
+            return location
+    if "njoro" in normalized:
+        return "NJORO"
+    if "elburgon" in normalized or "molo" in normalized:
+        return "ELBURGON & MOLO"
+    if "kihingo" in normalized or "stoo" in normalized:
+        return "KIHINGO & STOO"
+    return None
+
+
+def staff_for_business_location(db, value):
+    location = location_for_business_address(value)
+    if location is None:
+        return None
+    for row in db.execute("SELECT location, staff_id FROM staff_locations").fetchall():
+        if normalize_location(row["location"]) == normalize_location(location):
+            return row["staff_id"]
+    return None
 
 
 def connect_db():
@@ -163,6 +238,8 @@ def initialize_database():
             db.execute("ALTER TABLE clients ADD COLUMN form_filename TEXT NOT NULL DEFAULT ''")
         if "form_original_name" not in client_columns:
             db.execute("ALTER TABLE clients ADD COLUMN form_original_name TEXT NOT NULL DEFAULT ''")
+        if "assigned_staff_id" not in client_columns:
+            db.execute("ALTER TABLE clients ADD COLUMN assigned_staff_id INTEGER REFERENCES staff_users(id)")
         loan_columns = {row["name"] for row in db.execute("PRAGMA table_info(loans)").fetchall()}
         if "loan_number" not in loan_columns:
             db.execute("ALTER TABLE loans ADD COLUMN loan_number TEXT NOT NULL DEFAULT ''")
@@ -185,6 +262,39 @@ def initialize_database():
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
+        for username, locations in STAFF_LOCATION_MAP.items():
+            staff_user = db.execute(
+                "SELECT id FROM staff_users WHERE username = ? COLLATE NOCASE AND role = 'staff'",
+                (username,),
+            ).fetchone()
+            if staff_user is None:
+                continue
+            for location in locations:
+                db.execute(
+                    "INSERT OR IGNORE INTO staff_locations (staff_id, location) VALUES (?, ?)",
+                    (staff_user["id"], location),
+                )
+        for client in db.execute(
+            "SELECT id, business_location FROM clients WHERE assigned_staff_id IS NULL"
+        ).fetchall():
+            location = location_for_business_address(client["business_location"])
+            if location is None:
+                continue
+            owner = next(
+                (
+                    username for username, locations in STAFF_LOCATION_MAP.items()
+                    if location in locations
+                ),
+                None,
+            )
+            if owner:
+                db.execute(
+                    """UPDATE clients SET assigned_staff_id = (
+                         SELECT id FROM staff_users
+                         WHERE username = ? COLLATE NOCASE AND role = 'staff'
+                       ) WHERE id = ?""",
+                    (owner, client["id"]),
+                )
 
 
 initialize_database()
@@ -536,15 +646,214 @@ def client_ledger_files():
 
 
 def visible_client_ledger_files():
-    client_names = get_db().execute("SELECT name FROM clients").fetchall()
-    registered_names = {
-        re.sub(r"[^a-z0-9]", "", row["name"].casefold()) for row in client_names
+    files = client_ledger_files()
+    if g.staff_user["role"] == "admin":
+        return files
+
+    assigned_locations = {
+        normalize_location(row["location"])
+        for row in get_db().execute(
+            "SELECT location FROM staff_locations WHERE staff_id = ?",
+            (g.staff_user["id"],),
+        ).fetchall()
     }
     return [
         item
-        for item in client_ledger_files()
-        if re.sub(r"[^a-z0-9]", "", item["name"].casefold()) in registered_names
+        for item in files
+        if normalize_location(item["location"].split("/", 1)[0]) in assigned_locations
     ]
+
+
+def parse_ledger_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if not isinstance(value, str):
+        return None
+    for date_format in (
+        "%d/%m/%Y",
+        "%d/%m/%y",
+        "%Y-%m-%d",
+        "%d-%m-%Y",
+        "%d-%m-%y",
+        "%m/%d/%Y",
+    ):
+        try:
+            return datetime.strptime(value.strip(), date_format).date()
+        except ValueError:
+            continue
+    return None
+
+
+def ledger_number_cents(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        amount = Decimal(str(value).replace(",", "").strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if not amount.is_finite():
+        return None
+    return int((amount * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def read_ledger_payments(path, location, report_date):
+    workbook = load_workbook(path, data_only=True, read_only=True)
+    payments_found = []
+    client_name = path.stem.strip()
+    balance_columns = set()
+    try:
+        for worksheet in workbook.worksheets:
+            if not hasattr(worksheet, "iter_rows"):
+                continue
+            seen_data_rows = False
+            for row_number, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
+                values = list(row)
+                row_date = parse_ledger_date(values[0]) if values else None
+                if not seen_data_rows and row_date is None:
+                    if row_number <= 8 and values:
+                        first_cell = str(values[0] or "").strip().rstrip(".").casefold()
+                        if first_cell.startswith("name") and len(values) > 1 and values[1]:
+                            client_name = str(values[1]).strip().lstrip(":").strip() or client_name
+                        for column_index, value in enumerate(values):
+                            if isinstance(value, str) and "balance" in value.casefold():
+                                balance_columns.add(column_index)
+                elif row_date is not None:
+                    seen_data_rows = True
+                if not values or row_date != report_date:
+                    continue
+                text_values = [value.casefold() for value in values if isinstance(value, str)]
+                if any("loan granted" in value or "loaned" in value for value in text_values):
+                    continue
+                numeric_values = [
+                    amount
+                    for amount in (ledger_number_cents(value) for value in values[1:])
+                    if amount is not None
+                ]
+                if len(numeric_values) < 2:
+                    continue
+                if len(numeric_values) < 2:
+                    continue
+                last_balance = numeric_values[-1]
+                previous_value = numeric_values[-2]
+                paired_balances = len(balance_columns) >= 2 or (
+                    len(numeric_values) >= 3
+                    and (
+                        (previous_value == 0 and last_balance == 0 and len(numeric_values) >= 5)
+                        or (
+                            previous_value > 0
+                            and last_balance >= previous_value
+                            and last_balance <= previous_value * 2.5
+                        )
+                    )
+                )
+                amount_index = -3 if paired_balances else -2
+                if len(numeric_values) < abs(amount_index):
+                    continue
+                amount_cents = numeric_values[amount_index]
+                balance_cents = last_balance
+                if amount_cents <= 0:
+                    continue
+                payments_found.append(
+                    {
+                        "source_row": row_number,
+                        "location": location or "Unassigned",
+                        "client_name": client_name,
+                        "amount_cents": amount_cents,
+                        "balance_cents": balance_cents,
+                    }
+                )
+    finally:
+        workbook.close()
+    return payments_found
+
+
+def sync_ledger_report(db, report_date):
+    files = client_ledger_files()
+    current_paths = set()
+    for item in files:
+        relative_path = item["relative_path"]
+        current_paths.add(relative_path)
+        path = CLIENT_LEDGER_DIRECTORY / relative_path
+        try:
+            file_stat = path.stat()
+        except OSError as exc:
+            app.logger.warning("Could not stat client ledger %s: %s", relative_path, exc)
+            continue
+        cached = db.execute(
+            """SELECT modified_ns, file_size FROM ledger_report_scans
+               WHERE report_date = ? AND source_path = ?""",
+            (report_date.isoformat(), relative_path),
+        ).fetchone()
+        if (
+            cached
+            and cached["modified_ns"] == file_stat.st_mtime_ns
+            and cached["file_size"] == file_stat.st_size
+        ):
+            continue
+
+        db.execute(
+            """DELETE FROM ledger_report_payments
+               WHERE report_date = ? AND source_path = ?""",
+            (report_date.isoformat(), relative_path),
+        )
+        scan_error = ""
+        try:
+            records = read_ledger_payments(path, item["location"], report_date)
+            db.executemany(
+                """INSERT INTO ledger_report_payments
+                   (report_date, source_path, source_row, location, client_name,
+                    amount_cents, balance_cents)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        report_date.isoformat(),
+                        relative_path,
+                        record["source_row"],
+                        record["location"],
+                        record["client_name"],
+                        record["amount_cents"],
+                        record["balance_cents"],
+                    )
+                    for record in records
+                ],
+            )
+        except (OSError, ValueError, InvalidFileException, zipfile.BadZipFile) as exc:
+            scan_error = str(exc)[:500]
+            app.logger.warning("Could not read client ledger %s: %s", relative_path, exc)
+        db.execute(
+            """INSERT INTO ledger_report_scans
+               (report_date, source_path, modified_ns, file_size, error)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(report_date, source_path) DO UPDATE SET
+                 modified_ns = excluded.modified_ns,
+                 file_size = excluded.file_size,
+                 error = excluded.error""",
+            (
+                report_date.isoformat(),
+                relative_path,
+                file_stat.st_mtime_ns,
+                file_stat.st_size,
+                scan_error,
+            ),
+        )
+
+    stale_scans = db.execute(
+        "SELECT source_path FROM ledger_report_scans WHERE report_date = ?",
+        (report_date.isoformat(),),
+    ).fetchall()
+    for stale in stale_scans:
+        if stale["source_path"] not in current_paths:
+            db.execute(
+                "DELETE FROM ledger_report_payments WHERE report_date = ? AND source_path = ?",
+                (report_date.isoformat(), stale["source_path"]),
+            )
+            db.execute(
+                "DELETE FROM ledger_report_scans WHERE report_date = ? AND source_path = ?",
+                (report_date.isoformat(), stale["source_path"]),
+            )
+    db.commit()
 
 
 def ledger_cell_value(value):
@@ -730,6 +1039,7 @@ def session_status():
         return jsonify({"authenticated": False})
     return jsonify(
         {
+            "id": user["id"],
             "authenticated": True,
             "username": user["username"],
             "full_name": user["full_name"],
@@ -755,6 +1065,7 @@ def login():
     session["user_id"] = user["id"]
     return jsonify(
         {
+            "id": user["id"],
             "authenticated": True,
             "username": user["username"],
             "full_name": user["full_name"],
@@ -830,31 +1141,75 @@ def download_excel_ledger():
 @staff_required
 def dashboard():
     db = get_db()
+    scope = request.args.get("scope", "mine" if g.staff_user["role"] == "staff" else "company")
     today = date.today().isoformat()
+    if g.staff_user["role"] == "staff":
+        my_client_filter = "c.assigned_staff_id = ?"
+        params = (g.staff_user["id"],)
+        company_filter = "1 = 1"
+        company_params = ()
+    else:
+        my_client_filter = "1 = 1"
+        params = ()
+        company_filter = "1 = 1"
+        company_params = ()
     summary = db.execute(
-        """SELECT
-             (SELECT COUNT(*) FROM clients) AS client_count,
-             (SELECT COUNT(*) FROM loans WHERE status = 'active') AS active_loans,
+        f"""SELECT
+             (SELECT COUNT(*) FROM clients c WHERE {my_client_filter}) AS my_client_count,
+             (SELECT COUNT(*) FROM clients c WHERE {company_filter}) AS company_client_count,
+             (SELECT COUNT(*) FROM loans l JOIN clients c ON c.id = l.client_id WHERE l.status = 'active' AND {my_client_filter}) AS my_active_loans,
+             (SELECT COUNT(*) FROM loans l JOIN clients c ON c.id = l.client_id WHERE l.status = 'active' AND {company_filter}) AS company_active_loans,
              (SELECT COALESCE(SUM(l.total_due_cents - COALESCE(p.paid, 0)), 0)
               FROM loans l LEFT JOIN
                 (SELECT loan_id, SUM(amount_cents) AS paid FROM payments GROUP BY loan_id) p
-              ON p.loan_id = l.id WHERE l.status = 'active') AS outstanding_cents,
-             (SELECT COUNT(*) FROM notifications WHERE status = 'failed') AS failed_notifications"""
+              ON p.loan_id = l.id JOIN clients c ON c.id = l.client_id
+              WHERE l.status = 'active' AND {my_client_filter}) AS my_outstanding_cents,
+             (SELECT COALESCE(SUM(l.total_due_cents - COALESCE(p.paid, 0)), 0)
+              FROM loans l LEFT JOIN
+                (SELECT loan_id, SUM(amount_cents) AS paid FROM payments GROUP BY loan_id) p
+              ON p.loan_id = l.id JOIN clients c ON c.id = l.client_id
+              WHERE l.status = 'active' AND {company_filter}) AS company_outstanding_cents,
+             (SELECT COUNT(*) FROM notifications n JOIN clients c ON c.id = n.client_id WHERE n.status = 'failed' AND {my_client_filter}) AS my_failed_notifications,
+             (SELECT COUNT(*) FROM notifications n JOIN clients c ON c.id = n.client_id WHERE n.status = 'failed' AND {company_filter}) AS company_failed_notifications""",
+        params * 4 + company_params,
     ).fetchone()
     due_today = db.execute(
-        """SELECT COUNT(*) FROM loans l LEFT JOIN
-             (SELECT loan_id, SUM(amount_cents) AS paid FROM payments GROUP BY loan_id) p
-           ON p.loan_id = l.id
-           WHERE l.status = 'active' AND l.due_on <= ? AND l.total_due_cents > COALESCE(p.paid, 0)""",
+        f"""SELECT COUNT(*) FROM loans l
+           JOIN clients c ON c.id = l.client_id
+           LEFT JOIN (SELECT loan_id, SUM(amount_cents) AS paid FROM payments GROUP BY loan_id) p
+             ON p.loan_id = l.id
+           WHERE l.status = 'active' AND l.due_on <= ? AND l.total_due_cents > COALESCE(p.paid, 0) AND {my_client_filter if scope == 'mine' else company_filter}""",
+        (today,) + (params if scope == 'mine' else company_params),
+    ).fetchone()[0]
+    my_paid_today = db.execute(
+        """SELECT COALESCE(SUM(p.amount_cents), 0)
+           FROM payments p JOIN loans l ON l.id = p.loan_id
+           JOIN clients c ON c.id = l.client_id
+           WHERE date(p.paid_at) = ? AND c.assigned_staff_id = ?""",
+        (today, g.staff_user["id"]),
+    ).fetchone()[0]
+    company_paid_today = db.execute(
+        """SELECT COALESCE(SUM(p.amount_cents), 0)
+           FROM payments p JOIN loans l ON l.id = p.loan_id
+           JOIN clients c ON c.id = l.client_id
+           WHERE date(p.paid_at) = ?""",
         (today,),
     ).fetchone()[0]
+    selected_count = summary["my_client_count"] if scope == "mine" and g.staff_user["role"] == "staff" else summary["company_client_count"]
+    selected_outstanding = summary["my_outstanding_cents"] if scope == "mine" and g.staff_user["role"] == "staff" else summary["company_outstanding_cents"]
+    selected_failed = summary["my_failed_notifications"] if scope == "mine" and g.staff_user["role"] == "staff" else summary["company_failed_notifications"]
     return jsonify(
         {
-            "clients": summary["client_count"],
-            "active_loans": summary["active_loans"],
-            "outstanding": format_money(summary["outstanding_cents"]),
-            "failed_notifications": summary["failed_notifications"],
+            "clients": selected_count,
+            "active_loans": summary["my_active_loans"] if scope == "mine" and g.staff_user["role"] == "staff" else summary["company_active_loans"],
+            "outstanding": format_money(selected_outstanding),
+            "failed_notifications": selected_failed,
             "overdue_loans": due_today,
+            "my_clients": summary["my_client_count"],
+            "company_clients": summary["company_client_count"],
+            "my_paid_today": format_money(my_paid_today),
+            "company_paid_today": format_money(company_paid_today),
+            "scope": scope,
         }
     )
 
@@ -862,8 +1217,9 @@ def dashboard():
 @app.get("/api/clients")
 @staff_required
 def clients():
-    rows = get_db().execute(
-        """SELECT c.*,
+    scope = request.args.get("scope", "mine" if g.staff_user["role"] == "staff" else "company")
+    query = """SELECT c.*,
+             s.full_name AS assigned_staff_name,
              (SELECT l.id FROM loans l WHERE l.client_id = c.id AND l.status = 'active'
               ORDER BY l.id DESC LIMIT 1) AS active_loan_id,
              active_loan.principal_cents AS active_principal_cents,
@@ -871,6 +1227,7 @@ def clients():
              active_loan.total_due_cents AS active_total_due_cents,
              COALESCE(active_payments.total_paid_cents, 0) AS active_total_paid_cents
            FROM clients c
+           LEFT JOIN staff_users s ON s.id = c.assigned_staff_id
            LEFT JOIN loans active_loan ON active_loan.id = (
              SELECT l.id FROM loans l WHERE l.client_id = c.id AND l.status = 'active'
              ORDER BY l.id DESC LIMIT 1
@@ -878,13 +1235,22 @@ def clients():
            LEFT JOIN (
              SELECT loan_id, SUM(amount_cents) AS total_paid_cents
              FROM payments GROUP BY loan_id
-           ) active_payments ON active_payments.loan_id = active_loan.id
-           ORDER BY c.created_at DESC"""
-    ).fetchall()
+           ) active_payments ON active_payments.loan_id = active_loan.id"""
+    parameters = []
+    if g.staff_user["role"] == "staff":
+        if scope == "mine":
+            query += " WHERE c.assigned_staff_id = ?"
+            parameters.append(g.staff_user["id"])
+        else:
+            query += " WHERE 1 = 1"
+    query += " ORDER BY c.created_at DESC"
+    rows = get_db().execute(query, parameters).fetchall()
     return jsonify(
         [
             {
                 **client_row(row),
+                "assigned_staff_name": row["assigned_staff_name"],
+                "assigned_staff_id": row["assigned_staff_id"],
                 "active_total_balance": format_money(
                     max(0, (row["active_total_due_cents"] or 0) - row["active_total_paid_cents"])
                 ),
@@ -944,6 +1310,23 @@ def create_client():
         guarantor_phone = values[7]
         if not re.fullmatch(r"\+?[0-9]{9,15}", guarantor_phone):
             return error("Enter a valid guarantor phone number using 9 to 15 digits, optionally prefixed with +.")
+        assigned_staff_id = payload.get("assigned_staff_id")
+        if g.staff_user["role"] == "staff":
+            assigned_staff_id = g.staff_user["id"]
+        elif assigned_staff_id == "unassigned":
+            assigned_staff_id = None
+        elif assigned_staff_id not in (None, "", "0"):
+            assigned_staff_id = int(assigned_staff_id)
+            staff_member = get_db().execute(
+                "SELECT id FROM staff_users WHERE id = ? AND active = 1",
+                (assigned_staff_id,),
+            ).fetchone()
+            if staff_member is None:
+                return error("Selected staff member is not active.", 400)
+        else:
+            assigned_staff_id = staff_for_business_location(
+                get_db(), values[4]
+            )
         form_file = request.files.get("form_file")
         form_filename, form_original_name = save_docx(form_file)
         db = get_db()
@@ -953,14 +1336,15 @@ def create_client():
                      name, phone, national_id, business_type, business_location, residence_location,
                      guarantor_name, guarantor_phone, guarantor_national_id, guarantor_business_type,
                      guarantor_business_location, guarantor_residence_location, form_filename,
-                     form_original_name, created_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     form_original_name, assigned_staff_id, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     *values[:7],
                     guarantor_phone,
                     *values[8:],
                     form_filename,
                     form_original_name,
+                    assigned_staff_id,
                     datetime.now(timezone.utc).isoformat(),
                 ),
             )
@@ -976,7 +1360,7 @@ def create_client():
             app.logger.exception("Excel ledger update failed after client registration")
             return error(f"Client was saved, but the Excel ledger could not be updated: {exc}", 500)
         return jsonify({"id": cursor.lastrowid}), 201
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         return error(str(exc))
 
 
@@ -1543,6 +1927,80 @@ def notifications():
            ORDER BY n.id DESC LIMIT 200"""
     ).fetchall()
     return jsonify([dict(row) for row in rows])
+
+
+@app.get("/api/ledger/daily-payments")
+@staff_required
+def daily_ledger_payments():
+    requested_date = request.args.get("date", date.today().isoformat())
+    try:
+        report_date = date.fromisoformat(requested_date)
+        if report_date.isoformat() != requested_date:
+            raise ValueError
+    except ValueError:
+        return error("Report date must use YYYY-MM-DD format.")
+
+    db = get_db()
+    try:
+        sync_ledger_report(db, report_date)
+    except (OSError, sqlite3.Error) as exc:
+        app.logger.exception("Daily ledger report could not be refreshed")
+        return error(f"Could not refresh the daily ledger report: {exc}", 500)
+
+    rows = db.execute(
+        """SELECT p.location, p.client_name, p.amount_cents, p.balance_cents,
+                  sl.staff_id, u.full_name AS assigned_staff
+           FROM ledger_report_payments p
+           LEFT JOIN staff_locations sl ON sl.location = p.location
+           LEFT JOIN staff_users u ON u.id = sl.staff_id
+           WHERE p.report_date = ?
+           ORDER BY p.location COLLATE NOCASE, p.client_name COLLATE NOCASE,
+                    p.source_path, p.source_row""",
+        (requested_date,),
+    ).fetchall()
+    my_locations = [
+        row["location"]
+        for row in db.execute(
+            "SELECT location FROM staff_locations WHERE staff_id = ? ORDER BY location",
+            (g.staff_user["id"],),
+        ).fetchall()
+    ]
+    all_payments = [
+        {
+            "location": row["location"],
+            "client_name": row["client_name"],
+            "amount": format_money(row["amount_cents"]),
+            "balance": (
+                format_money(row["balance_cents"])
+                if row["balance_cents"] is not None
+                else None
+            ),
+            "assigned_staff": row["assigned_staff"] or "Unassigned",
+        }
+        for row in rows
+    ]
+    my_payments = [
+        payment for payment in all_payments if payment["location"] in my_locations
+    ]
+    error_rows = db.execute(
+        """SELECT source_path FROM ledger_report_scans
+           WHERE report_date = ? AND error != ''""",
+        (requested_date,),
+    ).fetchall()
+    unreadable_by_location = {}
+    for row in error_rows:
+        location = row["source_path"].split("/", 1)[0] or "Unassigned"
+        unreadable_by_location[location] = unreadable_by_location.get(location, 0) + 1
+    return jsonify(
+        {
+            "report_date": requested_date,
+            "my_locations": my_locations,
+            "my_payments": my_payments,
+            "all_payments": all_payments,
+            "unreadable_workbooks": sum(unreadable_by_location.values()),
+            "unreadable_by_location": unreadable_by_location,
+        }
+    )
 
 
 @app.cli.command("send-daily-reminders")

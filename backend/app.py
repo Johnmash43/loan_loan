@@ -685,6 +685,39 @@ def visible_client_ledger_files():
     ]
 
 
+def client_ledger_index(ledgers):
+    index = {}
+    for ledger in ledgers:
+        path = CLIENT_LEDGER_DIRECTORY / ledger["relative_path"]
+        workbook = None
+        try:
+            workbook = load_workbook(path, data_only=True, read_only=True)
+            national_ids = set()
+            for worksheet in workbook.worksheets:
+                for row in worksheet.iter_rows(min_row=1, max_row=3, values_only=True):
+                    values = list(row)
+                    for column_index in range(0, len(values) - 1, 2):
+                        label = str(values[column_index] or "").strip().rstrip(";").upper()
+                        if label in {"ID", "NATIONAL ID"} and values[column_index + 1] is not None:
+                            national_id = str(values[column_index + 1]).strip().lstrip(";").strip()
+                            if national_id:
+                                national_ids.add(national_id)
+                    for value in values:
+                        if isinstance(value, str) and value.strip().upper().startswith("ID;"):
+                            national_id = value.split(";", 1)[1].strip()
+                            if national_id:
+                                national_ids.add(national_id)
+            for national_id in national_ids:
+                index.setdefault(national_id, []).append(ledger)
+        except (OSError, InvalidFileException, zipfile.BadZipFile) as exc:
+            app.logger.exception("Client ledger could not be indexed: %s", path)
+            raise ValueError(f"Could not index client ledger {ledger['name']}: {exc}") from exc
+        finally:
+            if workbook is not None:
+                workbook.close()
+    return index
+
+
 def staff_can_edit_ledgers(staff_id):
     row = get_db().execute(
         """SELECT status FROM ledger_edit_requests
@@ -1723,12 +1756,26 @@ def clients():
             query += " WHERE 1 = 1"
     query += " ORDER BY c.created_at DESC"
     rows = get_db().execute(query, parameters).fetchall()
+    try:
+        ledgers_by_national_id = client_ledger_index(visible_client_ledger_files())
+    except (OSError, ValueError) as exc:
+        app.logger.exception("Client register could not be linked to the ledger workbooks")
+        return error(f"Could not link client register entries to ledgers: {exc}", 500)
     return jsonify(
         [
             {
                 **client_row(row),
                 "assigned_staff_name": row["assigned_staff_name"],
                 "assigned_staff_id": row["assigned_staff_id"],
+                "ledger_location": " · ".join(
+                    ledger["location"] or "Main folder"
+                    for ledger in ledgers_by_national_id.get(row["national_id"], [])
+                ),
+                "ledger_id": (
+                    ledgers_by_national_id[row["national_id"]][0]["id"]
+                    if len(ledgers_by_national_id.get(row["national_id"], [])) == 1
+                    else None
+                ),
                 "active_total_balance": format_money(
                     max(0, (row["active_total_due_cents"] or 0) - row["active_total_paid_cents"])
                 ),
@@ -1839,6 +1886,110 @@ def create_client():
             return error(f"Client was saved, but the Excel ledger could not be updated: {exc}", 500)
         return jsonify({"id": cursor.lastrowid}), 201
     except (TypeError, ValueError) as exc:
+        return error(str(exc))
+
+
+@app.patch("/api/clients/<int:client_id>")
+@staff_required
+def update_client(client_id):
+    payload = request.form if request.mimetype == "multipart/form-data" else (
+        request.get_json(silent=True) or {}
+    )
+    fields = {
+        "name": "Client name",
+        "phone": "Phone number",
+        "national_id": "National ID",
+        "business_type": "Business type",
+        "business_location": "Business location",
+        "residence_location": "Residence location",
+        "guarantor_name": "Guarantor name",
+        "guarantor_phone": "Guarantor phone number",
+        "guarantor_national_id": "Guarantor national ID",
+        "guarantor_business_type": "Guarantor business type",
+        "guarantor_business_location": "Guarantor business location",
+        "guarantor_residence_location": "Guarantor residence location",
+    }
+    db = get_db()
+    existing = db.execute(
+        "SELECT * FROM clients WHERE id = ?", (client_id,)
+    ).fetchone()
+    if existing is None:
+        return error("Client not found.", 404)
+    if g.staff_user["role"] != "admin" and existing["assigned_staff_id"] != g.staff_user["id"]:
+        return error("You can only edit clients assigned to your account.", 403)
+
+    new_form_filename = ""
+    try:
+        values = [required_text(payload, key, label) for key, label in fields.items()]
+        if not re.fullmatch(r"\+?[0-9]{9,15}", values[1]):
+            return error("Enter a valid phone number using 9 to 15 digits, optionally prefixed with +.")
+        if not re.fullmatch(r"\+?[0-9]{9,15}", values[7]):
+            return error("Enter a valid guarantor phone number using 9 to 15 digits, optionally prefixed with +.")
+
+        assigned_staff_id = existing["assigned_staff_id"]
+        if g.staff_user["role"] == "admin":
+            requested_staff = payload.get("assigned_staff_id", "")
+            if requested_staff == "unassigned":
+                assigned_staff_id = None
+            elif requested_staff not in (None, "", "0"):
+                try:
+                    assigned_staff_id = int(requested_staff)
+                except (TypeError, ValueError):
+                    return error("Choose a valid active staff member.")
+                staff_member = db.execute(
+                    "SELECT id FROM staff_users WHERE id = ? AND role = 'staff' AND active = 1",
+                    (assigned_staff_id,),
+                ).fetchone()
+                if staff_member is None:
+                    return error("Selected staff member is not active.", 400)
+            else:
+                assigned_staff_id = staff_for_business_location(db, values[4])
+
+        upload = request.files.get("form_file")
+        if upload is not None and upload.filename:
+            new_form_filename, new_form_original_name = save_docx(upload)
+        else:
+            new_form_original_name = existing["form_original_name"]
+        form_filename = new_form_filename or existing["form_filename"]
+
+        try:
+            db.execute(
+                """UPDATE clients SET
+                     name = ?, phone = ?, national_id = ?, business_type = ?,
+                     business_location = ?, residence_location = ?,
+                     guarantor_name = ?, guarantor_phone = ?, guarantor_national_id = ?,
+                     guarantor_business_type = ?, guarantor_business_location = ?,
+                     guarantor_residence_location = ?, form_filename = ?,
+                     form_original_name = ?, assigned_staff_id = ?
+                   WHERE id = ?""",
+                (
+                    *values[:7],
+                    values[7],
+                    *values[8:],
+                    form_filename,
+                    new_form_original_name,
+                    assigned_staff_id,
+                    client_id,
+                ),
+            )
+            db.commit()
+        except sqlite3.IntegrityError:
+            db.rollback()
+            if new_form_filename:
+                (FORMS_DIRECTORY / new_form_filename).unlink(missing_ok=True)
+            return error("A client with that national ID already exists.", 409)
+
+        if new_form_filename and existing["form_filename"]:
+            (FORMS_DIRECTORY / existing["form_filename"]).unlink(missing_ok=True)
+        try:
+            export_excel_ledger()
+        except (OSError, sqlite3.Error) as exc:
+            app.logger.exception("Excel ledger update failed after client update")
+            return error(f"Client was updated, but the Excel ledger could not be updated: {exc}", 500)
+        return jsonify({"id": client_id, "updated": True})
+    except (TypeError, ValueError) as exc:
+        if new_form_filename:
+            (FORMS_DIRECTORY / new_form_filename).unlink(missing_ok=True)
         return error(str(exc))
 
 

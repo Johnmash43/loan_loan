@@ -78,6 +78,8 @@ function App() {
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [clientForm, setClientForm] = useState(blankClient);
+  const [clientSearch, setClientSearch] = useState("");
+  const [editingClientId, setEditingClientId] = useState(null);
   const [formFile, setFormFile] = useState(null);
   const [staffForm, setStaffForm] = useState({ username: "", full_name: "", password: "" });
   const [loanForm, setLoanForm] = useState({
@@ -277,13 +279,34 @@ function App() {
     if (role === "staff" && !body.has("assigned_staff_id")) body.append("assigned_staff_id", String(sessionUserId || ""));
     if (formFile) body.append("form_file", formFile);
     const ok = await submit(
-      () => api("/api/clients", { method: "POST", body }),
-      "Client registered and added to the Excel ledger.",
+      () => api(editingClientId ? `/api/clients/${editingClientId}` : "/api/clients", {
+        method: editingClientId ? "PATCH" : "POST",
+        body,
+      }),
+      editingClientId ? "Client details updated." : "Client registered and added to the Excel ledger.",
     );
     if (ok) {
       setClientForm(blankClient);
       setFormFile(null);
+      setEditingClientId(null);
     }
+  }
+
+  function editClient(client) {
+    setEditingClientId(client.id);
+    setClientForm({
+      ...blankClient,
+      ...Object.fromEntries(
+        Object.keys(blankClient).map((key) => [key, client[key] == null ? "" : String(client[key])]),
+      ),
+    });
+    setFormFile(null);
+  }
+
+  function cancelClientEdit() {
+    setEditingClientId(null);
+    setClientForm(blankClient);
+    setFormFile(null);
   }
 
   async function saveLoan(event) {
@@ -461,6 +484,11 @@ function App() {
   const canEditLedgers = role === "admin" || currentLedgerEditRequest?.status === "granted";
   const approvedRenewals = renewalRequests.filter((renewal) => renewal.status === "approved");
   const filteredPayments = payments;
+  const filteredClients = clients.filter((client) =>
+    `${client.name} ${client.national_id} ${client.phone}`
+      .toLocaleLowerCase()
+      .includes(clientSearch.trim().toLocaleLowerCase()),
+  );
   function navigateToSection(targetSection) {
     const targetPath = SECTION_ROUTES[targetSection];
     if (!targetPath || (targetSection === "Staff" && role !== "admin")) return;
@@ -602,11 +630,34 @@ function App() {
               </div>
             )}
             <section className="panel">
-              <div className="panel-heading"><div><h2>Client register</h2><p>Clients, guarantors and generated forms</p></div></div>
-              <ClientTable rows={clients} onToggle={setAccount} />
+              <div className="panel-heading"><div><h2>Client register</h2><p>Search, edit, and manage client accounts</p></div></div>
+              <label className="client-search">
+                Search clients
+                <input
+                  type="search"
+                  value={clientSearch}
+                  onChange={(event) => setClientSearch(event.target.value)}
+                  placeholder="Name, National ID, or phone…"
+                />
+              </label>
+              <ClientTable
+                rows={filteredClients}
+                onToggle={setAccount}
+                onEdit={editClient}
+                onOpenLedger={(client) => {
+                  navigateToSection("Ledgers");
+                  openLedger({
+                    id: client.ledger_id,
+                    name: client.name,
+                    location: client.ledger_location,
+                  });
+                }}
+                canEdit={(client) => role === "admin" || client.assigned_staff_id === sessionUserId}
+                empty={clients.length ? "No clients match your search." : "No clients registered yet."}
+              />
             </section>
             <form className="panel form-panel" onSubmit={saveClient}>
-              <div className="panel-heading"><div><h2>Register a client</h2><p>Enter client and guarantor details</p></div></div>
+              <div className="panel-heading"><div><h2>{editingClientId ? "Edit client" : "Register a client"}</h2><p>{editingClientId ? "Update client and guarantor details" : "Enter client and guarantor details"}</p></div></div>
               <div className="form-section">CLIENT DETAILS</div>
               <div className="form-grid">
                 {role === "admin" && (
@@ -647,7 +698,10 @@ function App() {
                 <Field label="Business location" name="guarantor_business_location" value={clientForm.guarantor_business_location} onChange={updateClient(setClientForm)} required />
                 <Field className="span-two" label="Residence location" name="guarantor_residence_location" value={clientForm.guarantor_residence_location} onChange={updateClient(setClientForm)} required />
               </div>
-              <button className="primary" type="submit">Save client</button>
+              <div className="client-form-actions">
+                {editingClientId && <button className="secondary" type="button" onClick={cancelClientEdit}>Cancel</button>}
+                <button className="primary" type="submit">{editingClientId ? "Save changes" : "Save client"}</button>
+              </div>
             </form>
           </div>
         )}
@@ -886,20 +940,25 @@ function Stat({ label, value, icon }) {
   return <article className="stat-card"><span className="stat-icon">{icon}</span><p>{label}</p><strong>{value}</strong></article>;
 }
 
-function ClientTable({ rows, onToggle }) {
-  if (!rows.length) return <Empty text="No clients registered yet." />;
+function ClientTable({ rows, onToggle, onEdit, onOpenLedger, canEdit, empty }) {
+  if (!rows.length) return <Empty text={empty || "No clients registered yet."} />;
   return (
-    <div className="table-wrap"><table><thead><tr><th>Client</th><th>National ID</th><th>Phone</th><th>Assigned to</th><th>Principal Balance</th><th>Total Balance</th><th>Interest Earned</th><th>Form</th><th>Account</th><th>Action</th></tr></thead>
+    <div className="table-wrap"><table><thead><tr><th>Client</th><th>National ID</th><th>Phone</th><th>Ledger location</th><th>Assigned to</th><th>Principal Balance</th><th>Total Balance</th><th>Interest Earned</th><th>Form</th><th>Account</th><th>Actions</th></tr></thead>
       <tbody>{rows.map((client) => <tr key={client.id}>
         <td><strong>{client.name}</strong><small>{client.business_type}</small></td>
         <td>{client.national_id}</td><td>{client.phone}</td>
+        <td>{client.ledger_location || <span className="muted">No linked ledger</span>}</td>
         <td>{client.assigned_staff_name || "Unassigned"}</td>
         <td>{client.active_loan_id ? money(client.active_principal_balance) : "—"}</td>
         <td>{client.active_loan_id ? money(client.active_total_balance) : "—"}</td>
         <td>{client.active_loan_id ? money(client.active_interest_earned) : "—"}</td>
         <td>{client.form_filename ? <a href={`/api/clients/${client.id}/form`}>{client.form_original_name || "Download Word form ↗"}</a> : <span className="muted">—</span>}</td>
         <td><span className={`badge ${client.account_status}`}>{client.account_status}</span></td>
-        <td><button className="text-button small" onClick={() => onToggle(client, client.account_status === "active" ? "paused" : "active")}>{client.account_status === "active" ? "Pause" : "Reopen"}</button></td>
+        <td className="client-row-actions">
+          {client.ledger_id && <button className="text-button small" onClick={() => onOpenLedger(client)}>View ledger</button>}
+          {canEdit(client) && <button className="text-button small" onClick={() => onEdit(client)}>Edit</button>}
+          <button className="text-button small" onClick={() => onToggle(client, client.account_status === "active" ? "paused" : "active")}>{client.account_status === "active" ? "Pause" : "Reopen"}</button>
+        </td>
       </tr>)}</tbody>
     </table></div>
   );

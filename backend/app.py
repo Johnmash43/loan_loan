@@ -152,6 +152,17 @@ CREATE TABLE IF NOT EXISTS ledger_report_scans (
     error TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (report_date, source_path)
 );
+CREATE TABLE IF NOT EXISTS daily_location_snapshots (
+    snapshot_date TEXT NOT NULL,
+    location TEXT NOT NULL,
+    client_count INTEGER NOT NULL,
+    outstanding_cents INTEGER NOT NULL,
+    recovered_cents INTEGER NOT NULL,
+    principal_recovered_cents INTEGER NOT NULL,
+    interest_recovered_cents INTEGER NOT NULL,
+    captured_at TEXT NOT NULL,
+    PRIMARY KEY (snapshot_date, location)
+);
 CREATE TABLE IF NOT EXISTS ledger_report_payments (
     report_date TEXT NOT NULL,
     source_path TEXT NOT NULL,
@@ -1683,6 +1694,57 @@ def dashboard():
             if summary_row is not None:
                 summary_row[field] += amount
 
+    snapshot_time = datetime.now(timezone.utc).isoformat()
+    snapshot_rows = [
+        {
+            "location": summary_row["location"],
+            "client_count": len(summary_row["client_ids"]),
+            "outstanding_cents": summary_row["outstanding"],
+            "recovered_cents": summary_row["recovered"],
+            "principal_recovered_cents": summary_row["principal_recovered"],
+            "interest_recovered_cents": summary_row["interest_recovered"],
+        }
+        for summary_row in location_summaries.values()
+    ]
+    snapshot_rows.append(
+        {
+            "location": "All locations",
+            "client_count": len(all_client_ids),
+            "outstanding_cents": overall_totals["outstanding"],
+            "recovered_cents": overall_totals["recovered"],
+            "principal_recovered_cents": overall_totals["principal_recovered"],
+            "interest_recovered_cents": overall_totals["interest_recovered"],
+        }
+    )
+    db.executemany(
+        """INSERT INTO daily_location_snapshots (
+               snapshot_date, location, client_count, outstanding_cents,
+               recovered_cents, principal_recovered_cents,
+               interest_recovered_cents, captured_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(snapshot_date, location) DO UPDATE SET
+               client_count = excluded.client_count,
+               outstanding_cents = excluded.outstanding_cents,
+               recovered_cents = excluded.recovered_cents,
+               principal_recovered_cents = excluded.principal_recovered_cents,
+               interest_recovered_cents = excluded.interest_recovered_cents,
+               captured_at = excluded.captured_at""",
+        [
+            (
+                today,
+                item["location"],
+                item["client_count"],
+                item["outstanding_cents"],
+                item["recovered_cents"],
+                item["principal_recovered_cents"],
+                item["interest_recovered_cents"],
+                snapshot_time,
+            )
+            for item in snapshot_rows
+        ],
+    )
+    db.commit()
+
     location_summaries = list(location_summaries.values())
     for summary_row in location_summaries:
         summary_row["clients"] = len(summary_row.pop("client_ids"))
@@ -1721,6 +1783,85 @@ def dashboard():
             "locations": visible_locations,
             "location_summaries": location_summaries,
             "overall_location_summary": overall_location_summary,
+        }
+    )
+
+
+@app.get("/api/dashboard/location-history")
+@staff_required
+def dashboard_location_history():
+    db = get_db()
+    requested_date = request.args.get("date", "").strip()
+    if requested_date:
+        try:
+            datetime.strptime(requested_date, "%Y-%m-%d")
+        except ValueError:
+            return error("Snapshot date must use YYYY-MM-DD format.")
+
+    available_dates = [
+        row["snapshot_date"]
+        for row in db.execute(
+            """SELECT DISTINCT snapshot_date FROM daily_location_snapshots
+               ORDER BY snapshot_date DESC"""
+        ).fetchall()
+    ]
+    selected_date = requested_date or (available_dates[0] if available_dates else None)
+    if selected_date not in available_dates:
+        return jsonify(
+            {
+                "dates": available_dates,
+                "selected_date": selected_date,
+                "location_summaries": [],
+                "captured_at": None,
+            }
+        )
+
+    rows = db.execute(
+        """SELECT location, client_count, outstanding_cents, recovered_cents,
+                  principal_recovered_cents, interest_recovered_cents, captured_at
+           FROM daily_location_snapshots
+           WHERE snapshot_date = ? ORDER BY location COLLATE NOCASE""",
+        (selected_date,),
+    ).fetchall()
+    assigned_locations = {
+        normalize_location(row["location"])
+        for row in db.execute(
+            "SELECT location FROM staff_locations WHERE staff_id = ?",
+            (g.staff_user["id"],),
+        ).fetchall()
+    } if g.staff_user["role"] == "staff" else set()
+    summaries = []
+    overall_summary = None
+    for row in rows:
+        if row["location"] == "All locations":
+            overall_summary = {
+                "location": row["location"],
+                "clients": row["client_count"],
+                "outstanding": format_money(row["outstanding_cents"]),
+                "recovered": format_money(row["recovered_cents"]),
+                "principal_recovered": format_money(row["principal_recovered_cents"]),
+                "interest_recovered": format_money(row["interest_recovered_cents"]),
+            }
+            continue
+        summaries.append(
+            {
+                "location": row["location"],
+                "clients": row["client_count"],
+                "outstanding": format_money(row["outstanding_cents"]),
+                "recovered": format_money(row["recovered_cents"]),
+                "principal_recovered": format_money(row["principal_recovered_cents"]),
+                "interest_recovered": format_money(row["interest_recovered_cents"]),
+                "assigned_to_staff": normalize_location(row["location"]) in assigned_locations,
+            }
+        )
+    summaries.sort(key=lambda item: not item["assigned_to_staff"])
+    return jsonify(
+        {
+            "dates": available_dates,
+            "selected_date": selected_date,
+            "captured_at": rows[0]["captured_at"] if rows else None,
+            "overall_location_summary": overall_summary,
+            "location_summaries": summaries,
         }
     )
 

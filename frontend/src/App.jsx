@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 const SECTION_ROUTES = {
-  Overview: "/overview",
+  Dashboard: "/overview",
   Clients: "/clients",
   Ledgers: "/ledgers",
   Loans: "/loans",
@@ -12,7 +12,7 @@ const SECTION_ROUTES = {
 
 function sectionForPath(pathname) {
   const path = pathname.replace(/\/+$/, "").toLowerCase() || "/";
-  return Object.entries(SECTION_ROUTES).find(([, route]) => route === path)?.[0] || "Overview";
+  return Object.entries(SECTION_ROUTES).find(([, route]) => route === path)?.[0] || "Dashboard";
 }
 
 const blankClient = {
@@ -59,6 +59,8 @@ function App() {
   const [section, setSection] = useState(() => sectionForPath(window.location.pathname));
   const [clientScope, setClientScope] = useState("mine");
   const [dashboard, setDashboard] = useState(null);
+  const [locationArchive, setLocationArchive] = useState(null);
+  const [locationArchiveDate, setLocationArchiveDate] = useState("");
   const [clients, setClients] = useState([]);
   const [loans, setLoans] = useState([]);
   const [payments, setPayments] = useState([]);
@@ -109,7 +111,7 @@ function App() {
     if (loading) return;
     const requestedSection = sectionForPath(window.location.pathname);
     const targetSection = requestedSection === "Staff" && role !== "admin"
-      ? "Overview"
+      ? "Dashboard"
       : requestedSection;
     const targetPath = SECTION_ROUTES[targetSection];
     if (window.location.pathname !== targetPath) {
@@ -215,6 +217,25 @@ function App() {
       window.clearTimeout(timer);
     };
   }, [authenticated, section, paymentSearch, paymentDate]);
+
+  useEffect(() => {
+    if (!authenticated || section !== "Dashboard") return undefined;
+    let cancelled = false;
+    const params = new URLSearchParams();
+    if (locationArchiveDate) params.set("date", locationArchiveDate);
+    api(`/api/dashboard/location-history?${params}`)
+      .then((history) => {
+        if (cancelled) return;
+        setLocationArchive(history);
+        if (!locationArchiveDate && history.selected_date) {
+          setLocationArchiveDate(history.selected_date);
+        }
+      })
+      .catch((requestError) => {
+        if (!cancelled) setError(requestError.message);
+      });
+    return () => { cancelled = true; };
+  }, [authenticated, section, locationArchiveDate, dashboard]);
 
   useEffect(() => {
     if (!authenticated || section !== "Notifications") return undefined;
@@ -472,7 +493,7 @@ function App() {
     );
   }
 
-  const nav = ["Overview", "Clients", "Ledgers", "Loans", "Payments", "Notifications"];
+  const nav = ["Dashboard", "Clients", "Ledgers", "Loans", "Payments", "Notifications"];
   if (role === "admin") nav.push("Staff");
   const pendingRenewal = role === "admin"
     ? renewalRequests.find((renewal) => renewal.status === "pending")
@@ -559,7 +580,7 @@ function App() {
           </div>
         )}
 
-        {section === "Overview" && (
+        {section === "Dashboard" && (
           <>
             <section className="stats-grid">
               <Stat label={role === "staff" ? "My clients" : "Registered clients"} value={role === "staff" ? dashboard?.my_clients ?? 0 : dashboard?.clients ?? 0} icon="01" />
@@ -611,6 +632,59 @@ function App() {
                 <p className="location-rule-note">For loans with 25% interest, recovered payments are allocated proportionally between principal and interest.</p>
               </section>
             )}
+            <section className="panel location-panel">
+              <div className="panel-heading location-archive-heading">
+                <div>
+                  <h2>Daily location archive</h2>
+                  <p>Daily performance snapshots are saved automatically and shared with all staff and admins.</p>
+                </div>
+                <label className="location-archive-select">
+                  Snapshot date
+                  <select
+                    value={locationArchiveDate}
+                    onChange={(event) => setLocationArchiveDate(event.target.value)}
+                    disabled={!locationArchive?.dates?.length}
+                  >
+                    {!locationArchive?.dates?.length && <option value="">No archived days yet</option>}
+                    {locationArchive?.dates?.map((snapshotDate) => (
+                      <option key={snapshotDate} value={snapshotDate}>{snapshotDate}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              {locationArchive?.location_summaries?.length ? (
+                <>
+                  <div className="location-total">
+                    <h3>All locations <span>{locationArchive.overall_location_summary?.clients ?? 0} clients</span></h3>
+                    <div className="location-total-metrics">
+                      <div><span>Outstanding</span><strong>{money(locationArchive.overall_location_summary?.outstanding)}</strong></div>
+                      <div><span>Total recovered</span><strong>{money(locationArchive.overall_location_summary?.recovered)}</strong></div>
+                      <div><span>Principal recovered</span><strong>{money(locationArchive.overall_location_summary?.principal_recovered)}</strong></div>
+                      <div><span>Interest recovered</span><strong>{money(locationArchive.overall_location_summary?.interest_recovered)}</strong></div>
+                    </div>
+                  </div>
+                  <div className="location-summary-grid">
+                    {locationArchive.location_summaries.map((item) => (
+                      <article className="location-summary-card" key={item.location}>
+                        <h3>{item.location}{item.assigned_to_staff && <span className="location-assigned-badge">Your location</span>}</h3>
+                        <p>{item.clients} {item.clients === 1 ? "client" : "clients"}</p>
+                        <div className="location-metric"><span>Outstanding balance</span><strong>{money(item.outstanding)}</strong></div>
+                        <div className="location-metric"><span>Total recovered</span><strong>{money(item.recovered)}</strong></div>
+                        <div className="location-recovery-split">
+                          <span>Principal: {money(item.principal_recovered)}</span>
+                          <span>Interest: {money(item.interest_recovered)}</span>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                  {locationArchive.captured_at && (
+                    <p className="location-rule-note">Last updated: {new Date(locationArchive.captured_at).toLocaleString()}</p>
+                  )}
+                </>
+              ) : (
+                <Empty text="No daily snapshots are available yet. A snapshot is saved when the Dashboard is opened each day." />
+              )}
+            </section>
             {dashboard?.failed_notifications > 0 && (
               <div className="alert warning">{dashboard.failed_notifications} notification delivery/deliveries failed. Check the Notifications tab and webhook configuration.</div>
             )}
@@ -869,18 +943,21 @@ function App() {
             <section className="panel">
               <div className="panel-heading"><div><h2>Staff accounts</h2><p>People with access to Nama Traders</p></div></div>
               <DataTable
-                headers={["Name", "Username", "Access", "Status", "Added", "Action"]}
+                headers={["Name", "Username", "Access", "Status", "Added", "Actions"]}
                 rows={staff.map((member) => [
                   member.full_name, member.username, member.role,
                   <span className={`badge ${member.active ? "active" : "paused"}`}>{member.active ? "active" : "inactive"}</span>,
                   member.created_at,
-                  <button
-                    className="text-button small"
-                    onClick={() => toggleStaffActive(member)}
-                    disabled={member.role !== "staff"}
-                  >
-                    {member.active ? "Deactivate" : "Activate"}
-                  </button>,
+                  member.role === "staff" ? (
+                    <>
+                      <button
+                        className="text-button small"
+                        onClick={() => toggleStaffActive(member)}
+                      >
+                        {member.active ? "Deactivate" : "Activate"}
+                      </button>
+                    </>
+                  ) : "—",
                 ])}
                 empty="No staff accounts yet."
               />

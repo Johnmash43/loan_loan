@@ -99,6 +99,9 @@ h1, h2 { font-family: Manrope, sans-serif; }
 .panel-heading h2 { font-size: 15px; margin: 0 0 5px; }
 .panel-heading p { color: var(--muted); font-size: 11px; margin: 0; }
 .location-panel { margin-bottom: 23px; }
+.location-archive-heading { align-items: end; }
+.location-archive-select { display: grid; min-width: 170px; gap: 5px; color: var(--muted); font-size: 10px; font-weight: 600; }
+.location-archive-select select { height: 36px; border: 1px solid var(--line); border-radius: 7px; padding: 0 9px; color: var(--ink); background: white; }
 .location-total { padding: 17px; margin-bottom: 15px; border-radius: 10px; background: #fff8f2; }
 .location-total h3, .location-summary-card h3 { margin: 0; color: var(--ink); font-family: Manrope, sans-serif; font-size: 13px; }
 .location-total h3 span { margin-left: 8px; color: var(--muted); font: 500 10px "DM Sans", sans-serif; }
@@ -226,6 +229,8 @@ td a { color: var(--orange-dark); text-decoration: none; font-weight: 600; }
   .payment-filters { align-items: stretch; }
   .payment-filters label { min-width: 100%; }
   .payment-result-count { margin: 0; }
+  .location-archive-heading { align-items: stretch; flex-direction: column; }
+  .location-archive-select { min-width: 0; }
   .form-grid, .loan-fields, .demo-payment-fields { grid-template-columns: 1fr; }
   .span-two { grid-column: auto; }
   .login-card { padding: 25px; }

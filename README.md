@@ -13,8 +13,7 @@ A small staff-facing loan ledger built with a React/JavaScript frontend, a Pytho
 - Repayment starts on the calendar day after issue. The selected term is 25–30 days; total repayment is principal plus flat interest, distributed evenly as a daily installment estimate.
 - Paybill callback matches the `BillRefNumber` to the client's National ID, deduplicates M-Pesa transaction IDs, updates the loan balance, and creates a payment notification.
 - An automatically refreshed Excel workbook with a client account sheet and a payment history sheet. The payment history includes each payment's principal repayment, interest earned, remaining principal, total balance, weekday, date, month, year, and time.
-- A development-only Paybill simulator on the **Payments** page. It matches the client National ID, records a demo transaction, and updates account balances without contacting M-Pesa or moving money. Simulated payments are disabled in production.
-- A searchable **Ledgers** page that opens the existing client workbooks in the app, labeled by client name and folder. The source workbooks remain in their original directory and are not downloaded.
+- A searchable **Ledgers** page that opens and edits existing client workbooks in place. Administrators can edit ledgers; staff can request edit permission, which administrators may grant or revoke. Staff access remains limited to their assigned locations.
 - Staff can pause and reopen a client's account. A paused account cannot receive a new loan. Clients with an active loan cannot receive another.
 - A daily command creates the late-payment reminder on day 25 when a balance remains.
 - Notification history records pending, sent, and failed deliveries.
@@ -66,7 +65,7 @@ After a client is registered, a loan is issued, or an M-Pesa payment is recorded
 - **Client Accounts**: client and guarantor details, Word form name, account state, loan principal, interest, original total issued, total paid, remaining balance, term, and dates.
 - **Payment History**: one row per Paybill transaction, including principal and interest, original total issued, transaction payment, cumulative paid, remaining balance, weekday, date, month, year, and time.
 
-The **Ledgers** page reads client workbooks directly from `CLIENT_LEDGER_DIRECTORY` (default: `~/MASH/LEDGERS`). Set this variable to the folder containing the existing client ledger directories. Workbooks are opened read-only and displayed in the app; temporary Excel lock files are excluded. Set `EXCEL_LEDGER_PATH` and `FORMS_DIRECTORY` to change the generated workbook and form locations. SQLite remains the source of truth for app-managed client and payment data.
+The **Ledgers** page reads client workbooks directly from `CLIENT_LEDGER_DIRECTORY` (default: `~/MASH/LEDGERS`). Set this variable to the folder containing the existing client ledger directories. Administrators can edit ledger table cells; staff can submit an access request for administrator approval. Granted staff may edit only ledgers in their assigned locations. Edits are saved to the original workbook, formula cells are protected, and stale edits are rejected if the workbook changed after it was opened. Temporary Excel lock files are excluded. Set `EXCEL_LEDGER_PATH` and `FORMS_DIRECTORY` to change the generated workbook and form locations. SQLite remains the source of truth for app-managed client and payment data.
 
 Daily payment reports use the subfolder name as the location and refresh changed workbooks when opened. The configured locations are: Staff1 (NJORO, PIAVE NJORO), Staff2 (ELBURGON & MOLO, MAILI TATU), and Staff3 (EGERTON, EGERTON 2, KIHINGO & STOO). Locations without a staff assignment remain visible to administrators.
 
@@ -81,21 +80,6 @@ Content-Type: application/json
 ```
 
 The callback must include the standard fields `TransID`, `TransAmount`, `BusinessShortCode`, `BillRefNumber`, and optionally `MSISDN` and `TransTime`. `BillRefNumber` must exactly match a registered client's National ID. The callback endpoint is not a substitute for registering the Paybill confirmation URL with Safaricom. Restrict access to this endpoint at the network/proxy layer and inject the callback token only from that trusted integration; do not expose the token in browser code.
-
-For a safe UI demonstration, open **Payments**, select a client with an active loan, and enter an amount up to the displayed balance. The demo records a `DEMO-` transaction with the current local date and time. For a 25% loan, each payment follows the ledger allocation: 80% reduces principal and 20% is recorded as interest earned. The client and loan pages show the resulting principal balance and total balance. This is a local simulation, not an M-Pesa payment.
-
-For a **local-only test**, start Flask with test values, register a test client and issue a loan in the UI, then send a mock callback using that client's National ID:
-
-```bash
-MPESA_PAYBILL=123456 MPESA_CALLBACK_TOKEN=local-test-only .venv/bin/python backend/app.py
-
-curl -X POST http://127.0.0.1:5000/api/mpesa/callback \
-  -H 'Content-Type: application/json' \
-  -H 'X-Callback-Token: local-test-only' \
-  -d '{"TransID":"LOCALTEST001","TransAmount":"100.00","BusinessShortCode":"123456","BillRefNumber":"TEST_CLIENT_NATIONAL_ID","MSISDN":"254700000000","TransTime":"20261031130000"}'
-```
-
-Replace `TEST_CLIENT_NATIONAL_ID` with the test client's registered ID and use a unique `TransID` for each simulated deposit. Check the Payments screen and download the workbook to verify the payment date/time and updated balance. **Never send fabricated callbacks to a production or provider-connected system.**
 
 To deliver SMS or other payment/reminder messages, set `NOTIFICATION_WEBHOOK_URL` and optionally `NOTIFICATION_WEBHOOK_TOKEN`. The webhook receives a JSON object with `to` and `message`; it should return a successful HTTP status after accepting the message. Without a configured webhook, generated notifications remain visibly pending in the notification log. Delivery failures are saved and surfaced in the dashboard.
 
@@ -125,5 +109,5 @@ The interest rate is entered for each loan (the form defaults to 25%, matching t
 
 - Set `APP_ENV=production`, `FLASK_SECRET_KEY`, `STAFF_USERNAME`, `STAFF_PASSWORD`, `MPESA_PAYBILL`, and `MPESA_CALLBACK_TOKEN`. Production startup rejects missing security/Paybill configuration. The initial administrator password is taken from `STAFF_PASSWORD`; later staff credentials are managed in the application.
 - Serve Flask behind HTTPS and set `COOKIE_SECURE=true`; use a process manager and back up the SQLite database.
-- This starter app does not connect to Safaricom or an SMS provider on its own. Provider onboarding, callback forwarding, and SMS webhook implementation/configuration are deployment responsibilities.
+- The app processes payment confirmations delivered to its callback endpoint; Paybill onboarding and callback forwarding remain deployment responsibilities.
 - The application does not implement loan underwriting, credit bureau checks, or legal/regulatory compliance workflows. Confirm applicable lending, privacy, and consumer-protection requirements before production use.

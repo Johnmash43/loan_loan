@@ -67,13 +67,14 @@ function App() {
   const [dailyLedgerReport, setDailyLedgerReport] = useState(null);
   const [dailyLedgerLoading, setDailyLedgerLoading] = useState(false);
   const [renewalRequests, setRenewalRequests] = useState([]);
+  const [ledgerEditRequests, setLedgerEditRequests] = useState([]);
   const [staff, setStaff] = useState([]);
   const [ledgerFiles, setLedgerFiles] = useState([]);
+  const [paymentSearch, setPaymentSearch] = useState("");
+  const [paymentDate, setPaymentDate] = useState("");
   const [selectedLedger, setSelectedLedger] = useState(null);
   const [ledgerData, setLedgerData] = useState(null);
   const [ledgerLoading, setLedgerLoading] = useState(false);
-  const [demoPaymentSettings, setDemoPaymentSettings] = useState({ enabled: false, paybill: "" });
-  const [demoPaymentForm, setDemoPaymentForm] = useState({ client_id: "", amount: "" });
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [clientForm, setClientForm] = useState(blankClient);
@@ -118,13 +119,14 @@ function App() {
   const loadData = useCallback(async () => {
     try {
       const scope = role === "staff" ? clientScope : "company";
-      const [stats, clientRows, loanRows, paymentRows, notificationRows, renewals] = await Promise.all([
+      const [stats, clientRows, loanRows, paymentRows, notificationRows, renewals, editRequests] = await Promise.all([
         api(`/api/dashboard?scope=${scope}`),
         api(`/api/clients?scope=${scope}`),
         api("/api/loans"),
         api("/api/payments"),
         api("/api/notifications"),
         api("/api/renewal-requests"),
+        api("/api/ledger-edit-requests"),
       ]);
       setDashboard(stats);
       setClients(clientRows);
@@ -132,6 +134,7 @@ function App() {
       setPayments(paymentRows);
       setNotifications(notificationRows);
       setRenewalRequests(renewals);
+      setLedgerEditRequests(editRequests);
     } catch (requestError) {
       setError(requestError.message);
     }
@@ -140,7 +143,22 @@ function App() {
   useEffect(() => {
     if (!authenticated || role !== "admin") return undefined;
     const timer = window.setInterval(() => {
-      api("/api/renewal-requests").then(setRenewalRequests).catch((requestError) => setError(requestError.message));
+      Promise.all([api("/api/renewal-requests"), api("/api/ledger-edit-requests")])
+        .then(([renewals, editRequests]) => {
+          setRenewalRequests(renewals);
+          setLedgerEditRequests(editRequests);
+        })
+        .catch((requestError) => setError(requestError.message));
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, [authenticated, role]);
+
+  useEffect(() => {
+    if (!authenticated || role !== "staff") return undefined;
+    const timer = window.setInterval(() => {
+      api("/api/ledger-edit-requests")
+        .then(setLedgerEditRequests)
+        .catch((requestError) => setError(requestError.message));
     }, 15000);
     return () => window.clearInterval(timer);
   }, [authenticated, role]);
@@ -180,6 +198,23 @@ function App() {
   }, [authenticated, section]);
 
   useEffect(() => {
+    if (!authenticated || section !== "Payments") return undefined;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      const params = new URLSearchParams();
+      if (paymentSearch.trim()) params.set("search", paymentSearch.trim());
+      if (paymentDate) params.set("date", paymentDate);
+      api(`/api/payments?${params}`)
+        .then((rows) => { if (!cancelled) setPayments(rows); })
+        .catch((requestError) => { if (!cancelled) setError(requestError.message); });
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [authenticated, section, paymentSearch, paymentDate]);
+
+  useEffect(() => {
     if (!authenticated || section !== "Notifications") return undefined;
     setDailyLedgerLoading(true);
     api(`/api/ledger/daily-payments?date=${dailyLedgerReportDate}`)
@@ -188,14 +223,6 @@ function App() {
       .finally(() => setDailyLedgerLoading(false));
     return undefined;
   }, [authenticated, section, dailyLedgerReportDate]);
-
-  useEffect(() => {
-    if (authenticated) {
-      api("/api/demo/payment-settings")
-        .then(setDemoPaymentSettings)
-        .catch((requestError) => setError(requestError.message));
-    }
-  }, [authenticated]);
 
   async function submit(action, message) {
     setError("");
@@ -288,6 +315,27 @@ function App() {
     );
   }
 
+  async function requestLedgerEditAccess() {
+    await submit(
+      () => api("/api/ledger-edit-requests", { method: "POST" }),
+      "Ledger edit access request sent to the administrator.",
+    );
+  }
+
+  async function reviewLedgerEditRequest(editRequest, decision) {
+    await submit(
+      () => api(`/api/ledger-edit-requests/${editRequest.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ decision }),
+      }),
+      decision === "grant"
+        ? `Ledger edit access granted to ${editRequest.staff_name}.`
+        : decision === "deny"
+          ? `Ledger edit access request denied for ${editRequest.staff_name}.`
+          : `Ledger edit access revoked for ${editRequest.staff_name}.`,
+    );
+  }
+
   async function saveRenewal(event) {
     event.preventDefault();
     const ok = await submit(
@@ -327,6 +375,20 @@ function App() {
     if (ok) setStaffForm({ username: "", full_name: "", password: "" });
   }
 
+  async function toggleStaffActive(member) {
+    const active = !member.active;
+    await submit(
+      async () => {
+        await api(`/api/staff/${member.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ active }),
+        });
+        setStaff(await api("/api/staff"));
+      },
+      `${member.full_name}'s account ${active ? "activated" : "deactivated"}.`,
+    );
+  }
+
   async function openLedger(ledger) {
     setSelectedLedger(ledger);
     setLedgerData(null);
@@ -341,22 +403,25 @@ function App() {
     }
   }
 
-  async function saveDemoPayment(event) {
-    event.preventDefault();
-    const client = clients.find((row) => String(row.id) === demoPaymentForm.client_id);
-    if (!client) return;
+  async function saveLedgerEdits(edits, revision) {
+    if (!selectedLedger || !edits.length) return false;
+    let saveResult;
     const ok = await submit(
-      () => api("/api/demo/payments", {
-        method: "POST",
-        body: JSON.stringify({
-          client_id: client.id,
-          account_id: client.national_id,
-          amount: demoPaymentForm.amount,
-        }),
-      }),
-      "Demo payment recorded. No real M-Pesa transaction was sent.",
+      async () => {
+        saveResult = await api(`/api/client-ledgers/${selectedLedger.id}`, {
+          method: "PUT",
+          body: JSON.stringify({ revision, edits }),
+        });
+      },
+      "Client ledger changes saved.",
     );
-    if (ok) setDemoPaymentForm((current) => ({ ...current, amount: "" }));
+    if (ok && role === "staff" && saveResult?.edit_access_status === "revoked") {
+      setLedgerEditRequests((current) =>
+        current.map((editRequest) => ({ ...editRequest, status: "revoked" })),
+      );
+    }
+    if (ok) await openLedger(selectedLedger);
+    return ok;
   }
 
   if (loading) return <div className="loading">Loading Nama Traders…</div>;
@@ -386,14 +451,16 @@ function App() {
 
   const nav = ["Overview", "Clients", "Ledgers", "Loans", "Payments", "Notifications"];
   if (role === "admin") nav.push("Staff");
-  const demoLoans = loans.filter((loan) => loan.status === "active" && Number(loan.balance) > 0);
   const pendingRenewal = role === "admin"
     ? renewalRequests.find((renewal) => renewal.status === "pending")
     : null;
+  const pendingLedgerEditRequest = role === "admin"
+    ? ledgerEditRequests.find((editRequest) => editRequest.status === "pending")
+    : null;
+  const currentLedgerEditRequest = ledgerEditRequests[0];
+  const canEditLedgers = role === "admin" || currentLedgerEditRequest?.status === "granted";
   const approvedRenewals = renewalRequests.filter((renewal) => renewal.status === "approved");
-  const selectedDemoLoan = demoLoans.find(
-    (loan) => String(loan.client_id) === demoPaymentForm.client_id,
-  );
+  const filteredPayments = payments;
   function navigateToSection(targetSection) {
     const targetPath = SECTION_ROUTES[targetSection];
     if (!targetPath || (targetSection === "Staff" && role !== "admin")) return;
@@ -434,7 +501,7 @@ function App() {
         {error && <div className="alert error" role="alert">{error}<button onClick={() => setError("")}>×</button></div>}
         {success && <div className="alert success" role="status">{success}<button onClick={() => setSuccess("")}>×</button></div>}
 
-        {pendingRenewal && (
+        {pendingRenewal && !pendingLedgerEditRequest && (
           <div className="modal-backdrop" role="presentation">
             <section className="renewal-modal" role="dialog" aria-modal="true" aria-labelledby="renewal-title">
               <p className="eyebrow">RENEWAL APPROVAL</p>
@@ -450,6 +517,19 @@ function App() {
             </section>
           </div>
         )}
+        {pendingLedgerEditRequest && (
+          <div className="modal-backdrop" role="presentation">
+            <section className="renewal-modal" role="dialog" aria-modal="true" aria-labelledby="ledger-edit-approval-title">
+              <p className="eyebrow">LEDGER EDIT ACCESS</p>
+              <h2 id="ledger-edit-approval-title">{pendingLedgerEditRequest.staff_name} requested ledger editing</h2>
+              <p>Granting access lets this staff member edit the client workbook ledgers visible to their assigned locations.</p>
+              <div className="renewal-modal-actions">
+                <button className="secondary" onClick={() => reviewLedgerEditRequest(pendingLedgerEditRequest, "deny")}>Decline</button>
+                <button className="primary" onClick={() => reviewLedgerEditRequest(pendingLedgerEditRequest, "grant")}>Grant access</button>
+              </div>
+            </section>
+          </div>
+        )}
 
         {section === "Overview" && (
           <>
@@ -459,12 +539,16 @@ function App() {
               <Stat label={role === "staff" ? "My payments today" : "Outstanding balance"} value={role === "staff" ? money(dashboard?.my_paid_today) : money(dashboard?.outstanding)} icon="03" />
               <Stat label={role === "staff" ? "Company payments today" : "Overdue loans"} value={role === "staff" ? money(dashboard?.company_paid_today) : dashboard?.overdue_loans ?? 0} icon="04" />
             </section>
-            {role === "admin" && dashboard?.location_summaries && (
+            {dashboard?.location_summaries && (
               <section className="panel location-panel">
                 <div className="panel-heading">
                   <div>
-                    <h2>Location portfolio</h2>
-                    <p>Outstanding balances and payments recovered under the 25% interest rule</p>
+                    <h2>{role === "admin" ? "Location portfolio" : "Location performance"}</h2>
+                    <p>
+                      {role === "admin"
+                        ? "Outstanding balances and payments recovered under the 25% interest rule"
+                        : "Your assigned locations are shown first, followed by company-wide location performance"}
+                    </p>
                   </div>
                 </div>
                 <div className="location-total">
@@ -479,7 +563,7 @@ function App() {
                 <div className="location-summary-grid">
                   {dashboard.location_summaries.map((item) => (
                     <article className="location-summary-card" key={item.location}>
-                      <h3>{item.location}</h3>
+                      <h3>{item.location}{item.assigned_to_staff && <span className="location-assigned-badge">Your location</span>}</h3>
                       <p>{item.clients} {item.clients === 1 ? "client" : "clients"}</p>
                       <div className="location-metric">
                         <span>Outstanding balance</span>
@@ -572,10 +656,14 @@ function App() {
           <LedgerBrowser
             ledgers={ledgerFiles}
             role={role}
+            editAccessStatus={currentLedgerEditRequest?.status || ""}
+            canEdit={canEditLedgers}
             selected={selectedLedger}
             data={ledgerData}
             loading={ledgerLoading}
             onSelect={openLedger}
+            onRequestAccess={requestLedgerEditAccess}
+            onSave={saveLedgerEdits}
           />
         )}
 
@@ -639,67 +727,38 @@ function App() {
         )}
 
         {section === "Payments" && (
-          <div className="stack">
-            <form className="panel demo-payment" onSubmit={saveDemoPayment}>
-              <div className="panel-heading">
-                <div><h2>Try a Paybill payment</h2><p>Match a client using their National ID as the Paybill account number.</p></div>
-                <span className="badge orange">DEMO ONLY</span>
-              </div>
-              <div className="demo-notice">This records a simulated payment in the app. It does not contact M-Pesa or move real money.</div>
-              <div className="demo-payment-fields">
-                <label>Paybill
-                  <input value={demoPaymentSettings.paybill} readOnly />
-                </label>
-                <label>Client / loan
-                  <select
-                    value={demoPaymentForm.client_id}
-                    onChange={(event) => setDemoPaymentForm({ ...demoPaymentForm, client_id: event.target.value })}
-                    required
-                  >
-                    <option value="">Select an active loan</option>
-                    {demoLoans.map((loan) => (
-                      <option key={loan.id} value={loan.client_id}>
-                        {loan.client_name} · ID {loan.national_id} · balance {money(loan.balance)}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label>Paybill account number (National ID)
-                  <input value={selectedDemoLoan?.national_id || ""} readOnly placeholder="Select a client first" />
-                </label>
-                <Field
-                  label="Amount paid (KES)"
-                  name="amount"
-                  type="number"
-                  min="0.01"
-                  max={selectedDemoLoan?.balance || undefined}
-                  step="0.01"
-                  value={demoPaymentForm.amount}
-                  onChange={(event) => setDemoPaymentForm({ ...demoPaymentForm, amount: event.target.value })}
-                  required
-                />
-              </div>
-              {selectedDemoLoan && (
-                <div className="demo-loan-summary">
-                  <span>Principal balance <strong>{money(selectedDemoLoan.principal_balance)}</strong></span>
-                  <span>Interest earned <strong>{money(selectedDemoLoan.interest_earned)}</strong></span>
-                  <span>Total due <strong>{money(selectedDemoLoan.total_due)}</strong></span>
-                  <span>Total balance <strong>{money(selectedDemoLoan.balance)}</strong></span>
-                </div>
-              )}
-              <button className="primary" type="submit" disabled={!demoPaymentSettings.enabled || !selectedDemoLoan}>Record demo payment</button>
-            </form>
+          <div className="stack payments-print-area">
             <section className="panel">
-              <div className="panel-heading"><div><h2>Payment history</h2><p>Principal and interest allocation follows the loan’s interest rate, with the ledger’s 25% split when applicable.</p></div><span className="badge orange">PAYBILL ONLY</span></div>
+              <div className="panel-heading payments-heading">
+                <div><h2>Payment history</h2><p>Search by client name or National ID, and optionally filter by payment date.</p></div>
+                <div className="payments-actions">
+                  <span className="badge orange">PAYBILL ONLY</span>
+                  <button className="secondary no-print" type="button" onClick={() => window.print()} disabled={!filteredPayments.length}>Print list</button>
+                </div>
+              </div>
+              <div className="payment-filters no-print">
+                <label>
+                  Search client
+                  <input
+                    type="search"
+                    value={paymentSearch}
+                    onChange={(event) => setPaymentSearch(event.target.value)}
+                    placeholder="Client name or National ID…"
+                  />
+                </label>
+                <label>
+                  Payment date
+                  <input type="date" value={paymentDate} onChange={(event) => setPaymentDate(event.target.value)} />
+                </label>
+                <span className="payment-result-count">{filteredPayments.length} payment{filteredPayments.length === 1 ? "" : "s"}</span>
+              </div>
               <DataTable
-                headers={["Transaction", "Client", "Account ID", "Original Total", "Amount Paid", "Principal Repaid", "Interest Earned", "Principal Balance", "Total Balance", "Day", "Date", "Month", "Year", "Time"]}
-                rows={payments.map((row) => [
-                  row.transaction_id, row.client_name, row.national_id, money(row.original_total),
-                  money(row.amount), money(row.principal_paid), money(row.interest_earned),
-                  money(row.principal_balance), money(row.balance), row.payment_day,
-                  row.payment_date, row.payment_month, row.payment_year, row.payment_time,
+                headers={["Transaction", "Client", "Account ID", "Date", "Time", "Amount Paid", "Balance"]}
+                rows={filteredPayments.map((row) => [
+                  row.transaction_id, row.client_name, row.national_id,
+                  row.payment_date, row.payment_time, money(row.amount), money(row.balance),
                 ])}
-                empty="No Paybill deposits received yet."
+                empty={payments.length ? "No payments match this client and date." : "No Paybill deposits received yet."}
               />
             </section>
           </div>
@@ -756,13 +815,38 @@ function App() {
             <section className="panel">
               <div className="panel-heading"><div><h2>Staff accounts</h2><p>People with access to the loan management system</p></div></div>
               <DataTable
-                headers={["Name", "Username", "Access", "Status", "Added"]}
+                headers={["Name", "Username", "Access", "Status", "Added", "Action"]}
                 rows={staff.map((member) => [
                   member.full_name, member.username, member.role,
                   <span className={`badge ${member.active ? "active" : "paused"}`}>{member.active ? "active" : "inactive"}</span>,
                   member.created_at,
+                  <button
+                    className="text-button small"
+                    onClick={() => toggleStaffActive(member)}
+                    disabled={member.role !== "staff"}
+                  >
+                    {member.active ? "Deactivate" : "Activate"}
+                  </button>,
                 ])}
                 empty="No staff accounts yet."
+              />
+              <div className="panel-heading renewal-queue-heading"><div><h2>Ledger edit access</h2><p>Staff can edit their assigned client workbooks only after approval. Access remains active until revoked.</p></div></div>
+              <DataTable
+                headers={["Staff member", "Status", "Requested", "Action"]}
+                rows={ledgerEditRequests.map((editRequest) => [
+                  editRequest.staff_name,
+                  <span className={`badge ${editRequest.status === "granted" ? "active" : editRequest.status === "pending" ? "pending" : ""}`}>{editRequest.status}</span>,
+                  editRequest.created_at,
+                  editRequest.status === "pending" ? (
+                    <>
+                      <button className="text-button small" onClick={() => reviewLedgerEditRequest(editRequest, "grant")}>Grant</button>
+                      <button className="text-button small" onClick={() => reviewLedgerEditRequest(editRequest, "deny")}>Decline</button>
+                    </>
+                  ) : editRequest.status === "granted" ? (
+                    <button className="text-button small" onClick={() => reviewLedgerEditRequest(editRequest, "revoke")}>Revoke access</button>
+                  ) : "—",
+                ])}
+                empty="No staff ledger edit requests."
               />
               <div className="panel-heading renewal-queue-heading"><div><h2>Renewal requests</h2><p>Requests from staff appear here and as an approval pop-up.</p></div></div>
               <DataTable
@@ -884,30 +968,105 @@ function DailyPaymentGroups({ rows, empty }) {
   ));
 }
 
-function LedgerBrowser({ ledgers, role, selected, data, loading, onSelect }) {
+function LedgerBrowser({
+  ledgers,
+  role,
+  editAccessStatus,
+  canEdit,
+  selected,
+  data,
+  loading,
+  onSelect,
+  onRequestAccess,
+  onSave,
+}) {
   const [query, setQuery] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [edits, setEdits] = useState({});
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    setEditing(false);
+    setEdits({});
+  }, [selected?.id, data?.revision]);
+
   const visibleLedgers = ledgers.filter((ledger) =>
-    `${ledger.name} ${ledger.location}`.toLowerCase().includes(query.trim().toLowerCase()),
+    ledger.name.toLowerCase().includes(query.trim().toLowerCase()),
   );
+  const locationGroups = [...visibleLedgers.reduce((groups, ledger) => {
+    const location = ledger.location || "Main folder";
+    const locationLedgers = groups.get(location) || [];
+    locationLedgers.push(ledger);
+    groups.set(location, locationLedgers);
+    return groups;
+  }, new Map())].sort(([locationA], [locationB]) =>
+    locationA.localeCompare(locationB, undefined, { sensitivity: "base" }),
+  );
+  const supportsEditing = Boolean(
+    typeof data?.revision === "string"
+    && Array.isArray(data.sheets)
+    && data.sheets.every((sheet) =>
+      Array.isArray(sheet.headers)
+      && Array.isArray(sheet.rows)
+      && Array.isArray(sheet.formula_cells)
+      && (sheet.headers.length === 0
+        || (Array.isArray(sheet.row_numbers) && sheet.row_numbers.length === sheet.rows.length)),
+    ),
+  );
+
+  async function saveEdits() {
+    const pendingEdits = Object.values(edits);
+    if (!pendingEdits.length || !data) {
+      setEditing(false);
+      setEdits({});
+      return;
+    }
+    setSaving(true);
+    const saved = await onSave(pendingEdits, data.revision);
+    if (saved) {
+      setEditing(false);
+      setEdits({});
+    }
+    setSaving(false);
+  }
+
   return (
     <div className="ledger-browser">
       <section className="panel ledger-list">
-        <div className="panel-heading"><div><h2>{role === "admin" ? "Company ledgers" : "Your location ledgers"}</h2><p>{ledgers.length} workbooks available</p></div></div>
+        <div className="panel-heading"><div><h2>{role === "admin" ? "Company ledgers" : "Your location ledgers"}</h2><p>{ledgers.length} client workbooks across {new Set(ledgers.map((ledger) => ledger.location || "Main folder")).size} locations</p></div></div>
+        {role === "staff" && (
+          <div className="ledger-access-control">
+            {editAccessStatus === "granted" ? (
+              <span className="badge active">Ledger editing approved</span>
+            ) : editAccessStatus === "pending" ? (
+              <span className="badge pending">Edit access request pending</span>
+            ) : (
+              <button className="secondary" onClick={onRequestAccess}>Request ledger edit access</button>
+            )}
+          </div>
+        )}
         <label className="ledger-search">
-          Search by client
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Enter client name…" />
+          Search clients by name
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Enter a client name…" />
         </label>
         <div className="ledger-list-items">
-          {visibleLedgers.map((ledger) => (
-            <button
-              className={`ledger-list-item ${selected?.id === ledger.id ? "selected" : ""}`}
-              key={ledger.id}
-              onClick={() => onSelect(ledger)}
-            >
-              <span className="ledger-avatar">{ledger.name.trim().charAt(0).toUpperCase() || "L"}</span>
-              <span><strong>{ledger.name}</strong><small>{ledger.location || "Main folder"}</small></span>
-              <span className="ledger-arrow">›</span>
-            </button>
+          {locationGroups.map(([location, locationLedgers]) => (
+            <section className="ledger-location-group" key={location}>
+              <div className="ledger-location-heading">
+                <strong>{location}</strong>
+                <span>{locationLedgers.length} {locationLedgers.length === 1 ? "client" : "clients"}</span>
+              </div>
+              {locationLedgers.map((ledger) => (
+                <button
+                  className={`ledger-list-item ${selected?.id === ledger.id ? "selected" : ""}`}
+                  key={ledger.id}
+                  onClick={() => onSelect(ledger)}
+                >
+                  <span className="ledger-avatar">{ledger.name.trim().charAt(0).toUpperCase() || "L"}</span>
+                  <span><strong>{ledger.name}</strong><small>View client ledger</small></span>
+                  <span className="ledger-arrow">›</span>
+                </button>
+              ))}
+            </section>
           ))}
           {!visibleLedgers.length && <Empty text={ledgers.length ? "No clients match that search." : "No client workbooks found."} />}
         </div>
@@ -919,8 +1078,35 @@ function LedgerBrowser({ ledgers, role, selected, data, loading, onSelect }) {
           <>
             <div className="panel-heading ledger-detail-heading">
               <div><p className="eyebrow">CLIENT LEDGER · {data.location || "MAIN FOLDER"}</p><h2>{data.name}</h2></div>
-              <span className="ledger-view-badge">Live from workbook</span>
+              {canEdit && supportsEditing ? (
+                <div className="ledger-edit-actions">
+                  {editing ? (
+                    <>
+                      <button className="secondary" onClick={() => { setEditing(false); setEdits({}); }} disabled={saving}>Cancel</button>
+                      <button className="primary" onClick={saveEdits} disabled={saving}>{saving ? "Saving…" : "Save changes"}</button>
+                    </>
+                  ) : (
+                    <button
+                      className="secondary"
+                      type="button"
+                      onClick={() => {
+                        setEdits({});
+                        setEditing(true);
+                      }}
+                    >
+                      Edit ledger
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <span className="ledger-view-badge">{canEdit ? "Editing unavailable" : "Read only"}</span>
+              )}
             </div>
+            {canEdit && !supportsEditing && (
+              <div className="alert error" role="alert">
+                This ledger response is missing edit metadata. Reload the page; if this persists, restart the backend and try again.
+              </div>
+            )}
             {data.sheets.map((sheet) => (
               <section className="ledger-sheet" key={sheet.name}>
                 {sheet.metadata.length > 0 && (
@@ -940,7 +1126,31 @@ function LedgerBrowser({ ledgers, role, selected, data, loading, onSelect }) {
                           return (
                             <tr className={loanHeading ? "ledger-loan-heading" : ""} key={rowIndex}>
                               {row.map((value, cellIndex) => (
-                                <td key={cellIndex}>{value == null || value === "" ? "—" : typeof value === "number" ? value.toLocaleString("en-KE", { maximumFractionDigits: 2 }) : value}</td>
+                                <td key={cellIndex}>
+                                  {editing && !sheet.formula_cells.some(([formulaRow, formulaColumn]) =>
+                                    formulaRow === sheet.row_numbers[rowIndex] && formulaColumn === cellIndex + 1,
+                                  ) ? (
+                                    <input
+                                      className="ledger-cell-input"
+                                      aria-label={`${sheet.name}, row ${sheet.row_numbers[rowIndex]}, ${sheet.headers[cellIndex]}`}
+                                      value={edits[`${sheet.name}:${sheet.row_numbers[rowIndex]}:${cellIndex + 1}`]?.value ?? (value == null ? "" : String(value))}
+                                      onChange={(event) => {
+                                        const key = `${sheet.name}:${sheet.row_numbers[rowIndex]}:${cellIndex + 1}`;
+                                        setEdits((current) => ({
+                                          ...current,
+                                          [key]: {
+                                            sheet: sheet.name,
+                                            row: sheet.row_numbers[rowIndex],
+                                            column: cellIndex + 1,
+                                            value: event.target.value,
+                                          },
+                                        }));
+                                      }}
+                                    />
+                                  ) : (
+                                    value == null || value === "" ? "—" : typeof value === "number" ? value.toLocaleString("en-KE", { maximumFractionDigits: 2 }) : value
+                                  )}
+                                </td>
                               ))}
                             </tr>
                           );

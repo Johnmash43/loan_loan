@@ -173,6 +173,15 @@ CREATE TABLE IF NOT EXISTS renewal_requests (
     reviewed_at TEXT,
     reviewed_by INTEGER REFERENCES staff_users(id)
 );
+CREATE TABLE IF NOT EXISTS ledger_edit_requests (
+    id INTEGER PRIMARY KEY,
+    staff_id INTEGER NOT NULL REFERENCES staff_users(id),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'granted', 'denied', 'revoked')),
+    created_at TEXT NOT NULL,
+    reviewed_at TEXT,
+    reviewed_by INTEGER REFERENCES staff_users(id)
+);
 """
 
 
@@ -676,6 +685,15 @@ def visible_client_ledger_files():
     ]
 
 
+def staff_can_edit_ledgers(staff_id):
+    row = get_db().execute(
+        """SELECT status FROM ledger_edit_requests
+           WHERE staff_id = ? ORDER BY id DESC LIMIT 1""",
+        (staff_id,),
+    ).fetchone()
+    return row is not None and row["status"] == "granted"
+
+
 def parse_ledger_date(value):
     if isinstance(value, datetime):
         return value.date()
@@ -892,6 +910,102 @@ def list_client_ledgers():
     )
 
 
+@app.get("/api/ledger-edit-requests")
+@staff_required
+def list_ledger_edit_requests():
+    if g.staff_user["role"] == "admin":
+        rows = get_db().execute(
+            """SELECT r.*, u.full_name AS staff_name
+               FROM ledger_edit_requests r
+               JOIN staff_users u ON u.id = r.staff_id
+               WHERE r.id = (
+                   SELECT MAX(latest.id) FROM ledger_edit_requests latest
+                   WHERE latest.staff_id = r.staff_id
+               )
+               ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END, r.created_at DESC"""
+        ).fetchall()
+    else:
+        rows = get_db().execute(
+            """SELECT r.*, u.full_name AS staff_name
+               FROM ledger_edit_requests r
+               JOIN staff_users u ON u.id = r.staff_id
+               WHERE r.staff_id = ?
+               ORDER BY r.id DESC LIMIT 1""",
+            (g.staff_user["id"],),
+        ).fetchall()
+    return jsonify([dict(row) for row in rows])
+
+
+@app.post("/api/ledger-edit-requests")
+@staff_required
+def request_ledger_edit_access():
+    if g.staff_user["role"] != "staff":
+        return error("Only staff can request ledger edit access.", 403)
+    db = get_db()
+    latest = db.execute(
+        """SELECT status FROM ledger_edit_requests
+           WHERE staff_id = ? ORDER BY id DESC LIMIT 1""",
+        (g.staff_user["id"],),
+    ).fetchone()
+    if latest and latest["status"] in {"pending", "granted"}:
+        return error(
+            "Your ledger edit access request is already pending."
+            if latest["status"] == "pending"
+            else "You already have permission to edit ledgers.",
+            409,
+        )
+    cursor = db.execute(
+        """INSERT INTO ledger_edit_requests (staff_id, status, created_at)
+           VALUES (?, 'pending', ?)""",
+        (g.staff_user["id"], datetime.now(timezone.utc).isoformat()),
+    )
+    db.commit()
+    return jsonify({"id": cursor.lastrowid, "status": "pending"}), 201
+
+
+@app.patch("/api/ledger-edit-requests/<int:request_id>")
+@admin_required
+def review_ledger_edit_request(request_id):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return error("Expected a ledger edit decision.")
+    decision = payload.get("decision")
+    if decision not in {"grant", "deny", "revoke"}:
+        return error("Decision must be grant, deny, or revoke.")
+
+    db = get_db()
+    ledger_request = db.execute(
+        """SELECT r.*, u.active AS staff_active FROM ledger_edit_requests r
+           JOIN staff_users u ON u.id = r.staff_id
+           WHERE r.id = ? AND r.id = (
+               SELECT MAX(latest.id) FROM ledger_edit_requests latest
+               WHERE latest.staff_id = r.staff_id
+           )""",
+        (request_id,),
+    ).fetchone()
+    if ledger_request is None:
+        return error("Ledger edit request not found.", 404)
+    if decision == "grant" and not ledger_request["staff_active"]:
+        return error("Cannot grant ledger edit access to an inactive staff account.", 409)
+    expected_status = "granted" if decision == "revoke" else "pending"
+    if ledger_request["status"] != expected_status:
+        return error("This ledger edit request has already been reviewed.", 409)
+
+    new_status = {"grant": "granted", "deny": "denied", "revoke": "revoked"}[decision]
+    db.execute(
+        """UPDATE ledger_edit_requests
+           SET status = ?, reviewed_at = ?, reviewed_by = ? WHERE id = ?""",
+        (
+            new_status,
+            datetime.now(timezone.utc).isoformat(),
+            g.staff_user["id"],
+            request_id,
+        ),
+    )
+    db.commit()
+    return jsonify({"id": request_id, "status": new_status})
+
+
 @app.get("/api/client-ledgers/<ledger_id>")
 @staff_required
 def read_client_ledger(ledger_id):
@@ -903,15 +1017,22 @@ def read_client_ledger(ledger_id):
         if ledger is None:
             return error("Client ledger not found.", 404)
 
-        workbook = load_workbook(
-            CLIENT_LEDGER_DIRECTORY / ledger["relative_path"],
-            data_only=True,
-            read_only=True,
-        )
+        ledger_path = CLIENT_LEDGER_DIRECTORY / ledger["relative_path"]
+        revision = str(ledger_path.stat().st_mtime_ns)
+        workbook = load_workbook(ledger_path, data_only=True, read_only=True)
+        formula_workbook = None
         try:
+            formula_workbook = load_workbook(ledger_path, data_only=False, read_only=True)
             sheets = []
-            for worksheet in workbook.worksheets:
+            for worksheet, formula_worksheet in zip(workbook.worksheets, formula_workbook.worksheets):
                 sheet_rows = []
+                row_numbers = []
+                formula_cells = [
+                    [cell.row, cell.column]
+                    for row in formula_worksheet.iter_rows()
+                    for cell in row
+                    if cell.data_type == "f"
+                ]
                 header_row_index = None
                 metadata = []
                 for row_index, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
@@ -938,6 +1059,7 @@ def read_client_ledger(ledger_id):
                         continue
                     if header_row_index is not None and row_index > header_row_index:
                         sheet_rows.append(values)
+                        row_numbers.append(row_index)
                 if header_row_index is not None:
                     column_count = max(
                         len(headers),
@@ -953,11 +1075,25 @@ def read_client_ledger(ledger_id):
                         row + [None] * (column_count - len(row)) for row in sheet_rows
                     ]
                     sheets.append(
-                        {"name": worksheet.title, "metadata": metadata, "headers": headers, "rows": normalized_rows}
+                        {
+                            "name": worksheet.title,
+                            "metadata": metadata,
+                            "headers": headers,
+                            "rows": normalized_rows,
+                            "row_numbers": row_numbers,
+                            "formula_cells": formula_cells,
+                        }
                     )
                 elif sheet_rows:
                     sheets.append(
-                        {"name": worksheet.title, "metadata": metadata, "headers": [], "rows": sheet_rows}
+                        {
+                            "name": worksheet.title,
+                            "metadata": metadata,
+                            "headers": [],
+                            "rows": sheet_rows,
+                            "row_numbers": row_numbers,
+                            "formula_cells": formula_cells,
+                        }
                     )
             client_national_id = next(
                 (
@@ -1006,13 +1142,226 @@ def read_client_ledger(ledger_id):
                     "sheets": sheets,
                     "app_loans": app_loans,
                     "app_payments": app_payments,
+                    "editable": (
+                        g.staff_user["role"] == "admin"
+                        or staff_can_edit_ledgers(g.staff_user["id"])
+                    ),
+                    "revision": revision,
                 }
             )
         finally:
             workbook.close()
+            if formula_workbook is not None:
+                formula_workbook.close()
     except (OSError, ValueError, InvalidFileException, zipfile.BadZipFile) as exc:
         app.logger.exception("Client ledger could not be opened")
         return error(f"Could not open this client ledger: {exc}", 500)
+
+
+def parse_ledger_edit_value(value, current_value):
+    if value == "":
+        return None
+    if isinstance(current_value, bool):
+        if value.casefold() not in {"true", "false"}:
+            raise ValueError("Boolean cells accept only true or false.")
+        return value.casefold() == "true"
+    if isinstance(current_value, int):
+        try:
+            number = Decimal(value.replace(",", "").strip())
+        except InvalidOperation as exc:
+            raise ValueError("Enter a valid whole number for this cell.") from exc
+        if not number.is_finite() or number != number.to_integral_value():
+            raise ValueError("Enter a valid whole number for this cell.")
+        return int(number)
+    if isinstance(current_value, float):
+        try:
+            number = Decimal(value.replace(",", "").strip())
+        except InvalidOperation as exc:
+            raise ValueError("Enter a valid number for this cell.") from exc
+        if not number.is_finite():
+            raise ValueError("Enter a valid number for this cell.")
+        return float(number)
+    if isinstance(current_value, datetime):
+        for date_format in ("%d/%m/%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(value.strip(), date_format)
+            except ValueError:
+                continue
+        raise ValueError("Enter a date as DD/MM/YYYY or YYYY-MM-DD.")
+    if isinstance(current_value, date):
+        for date_format in ("%d/%m/%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(value.strip(), date_format).date()
+            except ValueError:
+                continue
+        raise ValueError("Enter a date as DD/MM/YYYY or YYYY-MM-DD.")
+    if isinstance(current_value, time):
+        for time_format in ("%H:%M:%S", "%H:%M"):
+            try:
+                return datetime.strptime(value.strip(), time_format).time()
+            except ValueError:
+                continue
+        raise ValueError("Enter a time as HH:MM or HH:MM:SS.")
+    return value
+
+
+@app.put("/api/client-ledgers/<ledger_id>")
+@staff_required
+def update_client_ledger(ledger_id):
+    if g.staff_user["role"] != "admin" and not staff_can_edit_ledgers(g.staff_user["id"]):
+        return error("Administrator approval is required to edit client ledgers.", 403)
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or not isinstance(payload.get("revision"), str):
+        return error("A valid workbook revision and cell edits are required.")
+    edits = payload.get("edits")
+    if not isinstance(edits, list) or not edits or len(edits) > 500:
+        return error("Provide between 1 and 500 cell edits.")
+
+    try:
+        ledger = next(
+            (item for item in visible_client_ledger_files() if item["id"] == ledger_id),
+            None,
+        )
+    except OSError as exc:
+        app.logger.exception("Client ledger directory could not be read while saving")
+        return error(f"Could not read the client ledger directory: {exc}", 500)
+    if ledger is None:
+        return error("Client ledger not found.", 404)
+
+    ledger_path = CLIENT_LEDGER_DIRECTORY / ledger["relative_path"]
+    try:
+        if str(ledger_path.stat().st_mtime_ns) != payload["revision"]:
+            return error("This workbook has changed. Reopen it before saving your edits.", 409)
+    except OSError as exc:
+        app.logger.exception("Client ledger could not be checked before saving")
+        return error(f"Could not access this client ledger: {exc}", 500)
+
+    workbook = None
+    temporary_path = None
+    edit_access_db = None
+    try:
+        workbook = load_workbook(ledger_path, data_only=False)
+        seen_cells = set()
+        table_bounds = {}
+        for edit in edits:
+            if not isinstance(edit, dict):
+                return error("Each cell edit must include a sheet, row, column, and text value.")
+            sheet_name = edit.get("sheet")
+            row_number = edit.get("row")
+            column_number = edit.get("column")
+            value = edit.get("value")
+            if (
+                not isinstance(sheet_name, str)
+                or type(row_number) is not int
+                or type(column_number) is not int
+                or row_number < 1
+                or column_number < 1
+                or not isinstance(value, str)
+                or len(value) > 2000
+            ):
+                return error("Each edit must use a valid sheet, cell address, and value of at most 2,000 characters.")
+            if sheet_name not in workbook.sheetnames:
+                return error("A requested worksheet was not found.")
+            cell_key = (sheet_name, row_number, column_number)
+            if cell_key in seen_cells:
+                return error("A cell cannot be edited more than once in the same save.")
+            seen_cells.add(cell_key)
+
+            worksheet = workbook[sheet_name]
+            if sheet_name not in table_bounds:
+                header_row = None
+                column_count = 0
+                data_rows = set()
+                for index, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
+                    if header_row is None:
+                        if {"DATE", "DETAILS"}.issubset(
+                            {str(item).strip().upper() for item in row if item is not None}
+                        ):
+                            header_row = index
+                            column_count = max(
+                                (column for column, item in enumerate(row, start=1) if item is not None),
+                                default=0,
+                            )
+                        continue
+                    if any(item is not None for item in row):
+                        data_rows.add(index)
+                        column_count = max(
+                            column_count,
+                            max(
+                                (column for column, item in enumerate(row, start=1) if item is not None),
+                                default=0,
+                            ),
+                        )
+                table_bounds[sheet_name] = (header_row, column_count, data_rows)
+            header_row, column_count, data_rows = table_bounds[sheet_name]
+            if (
+                header_row is None
+                or row_number <= header_row
+                or row_number not in data_rows
+                or column_number > column_count
+            ):
+                return error("Only cells in the client ledger table can be edited.")
+            cell = worksheet.cell(row=row_number, column=column_number)
+            if cell.data_type == "f":
+                return error("Formula cells cannot be edited from the ledger viewer.")
+            try:
+                cell.value = parse_ledger_edit_value(value, cell.value)
+            except ValueError as exc:
+                return error(str(exc))
+            if isinstance(cell.value, str) and cell.value.startswith(("=", "+", "-", "@", "\t", "\r")):
+                cell.data_type = "s"
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".xlsx", dir=ledger_path.parent, delete=False
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+        workbook.save(temporary_path)
+        workbook.close()
+        workbook = None
+        if str(ledger_path.stat().st_mtime_ns) != payload["revision"]:
+            return error("This workbook changed while your edits were being saved. Reopen it before trying again.", 409)
+        edit_access_status = None
+        if g.staff_user["role"] == "staff":
+            edit_access_db = get_db()
+            cursor = edit_access_db.execute(
+                """UPDATE ledger_edit_requests
+                   SET status = 'revoked', reviewed_at = ?, reviewed_by = NULL
+                   WHERE id = (
+                       SELECT MAX(id) FROM ledger_edit_requests
+                       WHERE staff_id = ? AND status = 'granted'
+                   )""",
+                (datetime.now(timezone.utc).isoformat(), g.staff_user["id"]),
+            )
+            if cursor.rowcount != 1:
+                app.logger.error(
+                    "Ledger save for staff user %s did not consume an edit approval",
+                    g.staff_user["id"],
+                )
+                edit_access_db.rollback()
+                return error("Could not revoke ledger edit access after saving. Contact an administrator.", 500)
+            edit_access_status = "revoked"
+        os.replace(temporary_path, ledger_path)
+        temporary_path = None
+        if edit_access_db is not None:
+            edit_access_db.commit()
+        return jsonify(
+            {
+                "saved": True,
+                "revision": str(ledger_path.stat().st_mtime_ns),
+                "edit_access_status": edit_access_status,
+            }
+        )
+    except (OSError, InvalidFileException, zipfile.BadZipFile) as exc:
+        if edit_access_db is not None:
+            edit_access_db.rollback()
+        app.logger.exception("Client ledger edits could not be saved")
+        return error(f"Could not save this client ledger: {exc}", 500)
+    finally:
+        if workbook is not None:
+            workbook.close()
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def save_docx(upload):
@@ -1133,6 +1482,28 @@ def create_staff():
         return error("That username is already in use.", 409)
 
 
+@app.patch("/api/staff/<int:staff_id>")
+@admin_required
+def update_staff_status(staff_id):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or type(payload.get("active")) is not bool:
+        return error("A valid active status is required.")
+    db = get_db()
+    staff_user = db.execute(
+        "SELECT id, role FROM staff_users WHERE id = ?", (staff_id,)
+    ).fetchone()
+    if staff_user is None:
+        return error("Staff account not found.", 404)
+    if staff_user["role"] != "staff":
+        return error("Administrator accounts cannot be changed here.", 403)
+    db.execute(
+        "UPDATE staff_users SET active = ? WHERE id = ?",
+        (int(payload["active"]), staff_id),
+    )
+    db.commit()
+    return jsonify({"id": staff_id, "active": payload["active"]})
+
+
 @app.get("/api/ledger.xlsx")
 @staff_required
 def download_excel_ledger():
@@ -1207,82 +1578,98 @@ def dashboard():
            WHERE date(p.paid_at) = ?""",
         (today,),
     ).fetchone()[0]
-    location_summaries = {}
     if g.staff_user["role"] == "admin":
-        location_summaries = {
-            location: {
-                "location": location,
-                "client_ids": set(),
-                "outstanding": 0,
-                "recovered": 0,
-                "principal_recovered": 0,
-                "interest_recovered": 0,
-            }
-            for location in DASHBOARD_LOCATIONS
-        }
-        all_client_ids = set()
-        overall_totals = {
+        visible_locations = list(DASHBOARD_LOCATIONS)
+    else:
+        visible_locations = [
+            row["location"]
+            for row in db.execute(
+                """SELECT location FROM staff_locations
+                   WHERE staff_id = ? ORDER BY location COLLATE NOCASE""",
+                (g.staff_user["id"],),
+            ).fetchall()
+        ]
+    assigned_location_keys = {normalize_location(location) for location in visible_locations}
+    location_summaries = {
+        location: {
+            "location": location,
+            "client_ids": set(),
             "outstanding": 0,
             "recovered": 0,
             "principal_recovered": 0,
             "interest_recovered": 0,
         }
-        location_rows = db.execute(
-            """SELECT c.id AS client_id, c.business_location,
-                      l.principal_cents, l.total_due_cents,
-                      COALESCE(SUM(p.amount_cents), 0) AS paid_cents
-               FROM clients c
-               LEFT JOIN loans l ON l.client_id = c.id
-               LEFT JOIN payments p ON p.loan_id = l.id
-               GROUP BY c.id, l.id"""
-        ).fetchall()
-        for row in location_rows:
-            location = location_for_business_address(row["business_location"])
-            canonical_location = next(
-                (item for item in DASHBOARD_LOCATIONS
-                 if location is not None
-                 and normalize_location(item) == normalize_location(location)),
-                None,
-            )
-            if canonical_location is None:
-                summary_row = None
-            else:
-                summary_row = location_summaries[canonical_location]
-                summary_row["client_ids"].add(row["client_id"])
-            all_client_ids.add(row["client_id"])
-            if row["total_due_cents"] is None:
-                continue
-            principal_cents = row["principal_cents"]
-            total_due_cents = row["total_due_cents"]
-            paid_cents = min(max(row["paid_cents"], 0), total_due_cents)
-            principal_recovered_cents = allocated_principal_cents(
-                principal_cents, total_due_cents, paid_cents
-            )
-            loan_totals = {
-                "outstanding": max(0, total_due_cents - row["paid_cents"]),
-                "recovered": paid_cents,
-                "principal_recovered": principal_recovered_cents,
-                "interest_recovered": paid_cents - principal_recovered_cents,
-            }
-            for field, amount in loan_totals.items():
-                overall_totals[field] += amount
-                if summary_row is not None:
-                    summary_row[field] += amount
-
-        location_summaries = list(location_summaries.values())
-        for summary_row in location_summaries:
-            summary_row["clients"] = len(summary_row.pop("client_ids"))
-            for field in ("outstanding", "recovered", "principal_recovered", "interest_recovered"):
-                summary_row[field] = format_money(summary_row[field])
-
-        overall_location_summary = {
-            "location": "All locations",
-            "clients": len(all_client_ids),
-            **{
-                field: format_money(amount)
-                for field, amount in overall_totals.items()
-            },
+        for location in DASHBOARD_LOCATIONS
+    }
+    all_client_ids = set()
+    overall_totals = {
+        "outstanding": 0,
+        "recovered": 0,
+        "principal_recovered": 0,
+        "interest_recovered": 0,
+    }
+    location_rows = db.execute(
+        """SELECT c.id AS client_id, c.business_location,
+                  l.principal_cents, l.total_due_cents,
+                  COALESCE(SUM(p.amount_cents), 0) AS paid_cents
+           FROM clients c
+           LEFT JOIN loans l ON l.client_id = c.id
+           LEFT JOIN payments p ON p.loan_id = l.id
+           GROUP BY c.id, l.id"""
+    ).fetchall()
+    for row in location_rows:
+        location = location_for_business_address(row["business_location"])
+        canonical_location = next(
+            (item for item in DASHBOARD_LOCATIONS
+             if location is not None
+             and normalize_location(item) == normalize_location(location)),
+            None,
+        )
+        if canonical_location is None:
+            summary_row = None
+        else:
+            summary_row = location_summaries[canonical_location]
+            summary_row["client_ids"].add(row["client_id"])
+        all_client_ids.add(row["client_id"])
+        if row["total_due_cents"] is None:
+            continue
+        principal_cents = row["principal_cents"]
+        total_due_cents = row["total_due_cents"]
+        paid_cents = min(max(row["paid_cents"], 0), total_due_cents)
+        principal_recovered_cents = allocated_principal_cents(
+            principal_cents, total_due_cents, paid_cents
+        )
+        loan_totals = {
+            "outstanding": max(0, total_due_cents - row["paid_cents"]),
+            "recovered": paid_cents,
+            "principal_recovered": principal_recovered_cents,
+            "interest_recovered": paid_cents - principal_recovered_cents,
         }
+        for field, amount in loan_totals.items():
+            overall_totals[field] += amount
+            if summary_row is not None:
+                summary_row[field] += amount
+
+    location_summaries = list(location_summaries.values())
+    for summary_row in location_summaries:
+        summary_row["clients"] = len(summary_row.pop("client_ids"))
+        summary_row["assigned_to_staff"] = (
+            normalize_location(summary_row["location"]) in assigned_location_keys
+            if g.staff_user["role"] == "staff"
+            else False
+        )
+        for field in ("outstanding", "recovered", "principal_recovered", "interest_recovered"):
+            summary_row[field] = format_money(summary_row[field])
+    location_summaries.sort(key=lambda item: not item["assigned_to_staff"])
+
+    overall_location_summary = {
+        "location": "All locations",
+        "clients": len(all_client_ids),
+        **{
+            field: format_money(amount)
+            for field, amount in overall_totals.items()
+        },
+    }
     selected_count = summary["my_client_count"] if scope == "mine" and g.staff_user["role"] == "staff" else summary["company_client_count"]
     selected_outstanding = summary["my_outstanding_cents"] if scope == "mine" and g.staff_user["role"] == "staff" else summary["company_outstanding_cents"]
     selected_failed = summary["my_failed_notifications"] if scope == "mine" and g.staff_user["role"] == "staff" else summary["company_failed_notifications"]
@@ -1298,14 +1685,9 @@ def dashboard():
             "my_paid_today": format_money(my_paid_today),
             "company_paid_today": format_money(company_paid_today),
             "scope": scope,
-            **(
-                {
-                    "location_summaries": location_summaries,
-                    "overall_location_summary": overall_location_summary,
-                }
-                if g.staff_user["role"] == "admin"
-                else {}
-            ),
+            "locations": visible_locations,
+            "location_summaries": location_summaries,
+            "overall_location_summary": overall_location_summary,
         }
     )
 
@@ -1759,15 +2141,44 @@ def create_loan():
 @app.get("/api/payments")
 @staff_required
 def payments():
+    requested_date = request.args.get("date", "").strip()
+    search = request.args.get("search", "").strip()
+    if requested_date:
+        try:
+            datetime.strptime(requested_date, "%Y-%m-%d")
+        except ValueError:
+            return error("Payment date must use YYYY-MM-DD format.")
+    if len(search) > 100:
+        return error("Payment search text must be 100 characters or fewer.")
+
+    filters = []
+    parameters = []
+    if requested_date:
+        filters.append("date(payment_history.paid_at) = ?")
+        parameters.append(requested_date)
+    if search:
+        filters.append(
+            "(instr(lower(payment_history.client_name), lower(?)) > 0 "
+            "OR instr(lower(payment_history.national_id), lower(?)) > 0)"
+        )
+        parameters.extend((search, search))
+    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+    limit_clause = "" if filters else "LIMIT 200"
     rows = get_db().execute(
-        """SELECT p.*, c.name AS client_name, c.national_id, l.principal_cents,
-                  l.total_due_cents,
-                  SUM(p.amount_cents) OVER (
-                    PARTITION BY p.loan_id ORDER BY p.id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                  ) AS cumulative_paid_cents
-           FROM payments p JOIN loans l ON l.id = p.loan_id
-           JOIN clients c ON c.id = l.client_id
-           ORDER BY p.id DESC LIMIT 200"""
+        f"""WITH payment_history AS (
+                SELECT p.*, c.name AS client_name, c.national_id, l.principal_cents,
+                       l.total_due_cents,
+                       SUM(p.amount_cents) OVER (
+                         PARTITION BY p.loan_id ORDER BY p.id
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       ) AS cumulative_paid_cents
+                FROM payments p JOIN loans l ON l.id = p.loan_id
+                JOIN clients c ON c.id = l.client_id
+            )
+            SELECT * FROM payment_history
+            {where_clause}
+            ORDER BY id DESC {limit_clause}""",
+        parameters,
     ).fetchall()
     return jsonify(
         [payment_row(row) for row in rows]
@@ -1808,100 +2219,6 @@ def payment_row(row):
         payment_time=paid_at.strftime("%H:%M:%S"),
     )
     return row_data
-
-
-@app.get("/api/demo/payment-settings")
-@staff_required
-def demo_payment_settings():
-    return jsonify(
-        {
-            "enabled": os.environ.get("APP_ENV") != "production",
-            "paybill": PAYBILL or "Demo only — no live Paybill configured",
-        }
-    )
-
-
-@app.post("/api/demo/payments")
-@staff_required
-def create_demo_payment():
-    if os.environ.get("APP_ENV") == "production":
-        return error("Demo payments are disabled in production.", 403)
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        return error("Expected a JSON demo payment.")
-    try:
-        client_id = int(payload.get("client_id", 0))
-        account_id = required_text(payload, "account_id", "Paybill account number")
-        amount_cents = money_to_cents(payload.get("amount"))
-    except (ValueError, TypeError):
-        return error("Enter a valid client, account number, and payment amount.")
-
-    db = get_db()
-    client = db.execute("SELECT * FROM clients WHERE id = ?", (client_id,)).fetchone()
-    if client is None:
-        return error("Client not found.", 404)
-    if account_id != client["national_id"]:
-        return error("The Paybill account number must match the client's National ID.", 400)
-    loan = db.execute(
-        "SELECT * FROM loans WHERE client_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
-        (client_id,),
-    ).fetchone()
-    if loan is None:
-        return error("No active loan is available for this client.", 409)
-
-    paid_so_far = db.execute(
-        "SELECT COALESCE(SUM(amount_cents), 0) FROM payments WHERE loan_id = ?",
-        (loan["id"],),
-    ).fetchone()[0]
-    balance = max(0, loan["total_due_cents"] - paid_so_far)
-    if amount_cents > balance:
-        return error(f"Payment cannot exceed the remaining total balance of KES {format_money(balance)}.")
-
-    paid_at = datetime.now().astimezone().replace(microsecond=0)
-    transaction_id = f"DEMO-{uuid.uuid4().hex[:12].upper()}"
-    demo_payload = {
-        "TransID": transaction_id,
-        "TransAmount": format_money(amount_cents),
-        "BusinessShortCode": PAYBILL or "DEMO",
-        "BillRefNumber": account_id,
-        "MSISDN": client["phone"],
-        "TransTime": paid_at.strftime("%Y%m%d%H%M%S"),
-    }
-    try:
-        db.execute(
-            """INSERT INTO payments (loan_id, transaction_id, amount_cents, phone, paid_at, raw_payload)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                loan["id"],
-                transaction_id,
-                amount_cents,
-                client["phone"],
-                paid_at.isoformat(sep=" "),
-                json.dumps(demo_payload),
-            ),
-        )
-        total_paid = paid_so_far + amount_cents
-        if total_paid >= loan["total_due_cents"]:
-            db.execute("UPDATE loans SET status = 'settled' WHERE id = ?", (loan["id"],))
-        db.commit()
-    except sqlite3.IntegrityError:
-        db.rollback()
-        return error("Could not record this demo payment.", 409)
-
-    try:
-        export_excel_ledger()
-    except (OSError, sqlite3.Error) as exc:
-        app.logger.exception("Excel ledger update failed after demo payment")
-        return error(f"Payment was recorded, but the Excel ledger could not be updated: {exc}", 500)
-    return jsonify(
-        {
-            "accepted": True,
-            "demo": True,
-            "transaction_id": transaction_id,
-            "amount": format_money(amount_cents),
-            "balance": format_money(max(0, loan["total_due_cents"] - total_paid)),
-        }
-    ), 201
 
 
 @app.post("/api/mpesa/callback")

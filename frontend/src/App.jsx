@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 const SECTION_ROUTES = {
   Overview: "/overview",
@@ -495,7 +495,7 @@ function App() {
       </aside>
       <main className="main">
         <header className="topbar">
-          <div><p className="eyebrow">LOAN MANAGEMENT</p><h1>{section}</h1></div>
+          <div><p className="eyebrow">NAMA TRADERS</p><h1>{section}</h1></div>
           <div className="topbar-actions"><div className="staff-avatar">{role === "admin" ? "A" : "S"}</div></div>
         </header>
         {error && <div className="alert error" role="alert">{error}<button onClick={() => setError("")}>×</button></div>}
@@ -813,7 +813,7 @@ function App() {
         {section === "Staff" && role === "admin" && (
           <div className="content-grid staff-layout">
             <section className="panel">
-              <div className="panel-heading"><div><h2>Staff accounts</h2><p>People with access to the loan management system</p></div></div>
+              <div className="panel-heading"><div><h2>Staff accounts</h2><p>People with access to Nama Traders</p></div></div>
               <DataTable
                 headers={["Name", "Username", "Access", "Status", "Added", "Action"]}
                 rows={staff.map((member) => [
@@ -1197,7 +1197,73 @@ function LedgerBrowser({
           </>
         )}
       </section>
+      <FloatingLedgerNavigation />
     </div>
+  );
+}
+
+function FloatingLedgerNavigation() {
+  const [position, setPosition] = useState(null);
+  const dragStart = useRef(null);
+
+  function startDragging(event) {
+    event.preventDefault();
+    const bounds = event.currentTarget.parentElement.getBoundingClientRect();
+    dragStart.current = {
+      pointerX: event.clientX,
+      pointerY: event.clientY,
+      left: bounds.left,
+      top: bounds.top,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function drag(event) {
+    if (!dragStart.current) return;
+    const start = dragStart.current;
+    const width = event.currentTarget.parentElement.offsetWidth;
+    const height = event.currentTarget.parentElement.offsetHeight;
+    setPosition({
+      left: Math.max(0, Math.min(window.innerWidth - width, start.left + event.clientX - start.pointerX)),
+      top: Math.max(0, Math.min(window.innerHeight - height, start.top + event.clientY - start.pointerY)),
+    });
+  }
+
+  function stopDragging() {
+    dragStart.current = null;
+  }
+
+  function scrollHorizontally(direction) {
+    document.querySelectorAll(".ledger-detail .table-wrap").forEach((table) => {
+      table.scrollBy({ left: direction * 280, behavior: "smooth" });
+    });
+  }
+
+  return (
+    <aside
+      className={`ledger-floating-nav ${position ? "is-positioned" : ""}`}
+      style={position ? { left: position.left, top: position.top } : undefined}
+      aria-label="Ledger navigation controls"
+    >
+      <button
+        className="ledger-nav-drag"
+        type="button"
+        aria-label="Drag to move navigation controls"
+        title="Drag to move"
+        onPointerDown={startDragging}
+        onPointerMove={drag}
+        onPointerUp={stopDragging}
+        onPointerCancel={stopDragging}
+      >
+        <span aria-hidden="true">⠿</span> Move
+      </button>
+      <div className="ledger-nav-directions">
+        <button type="button" aria-label="Scroll ledger up" title="Scroll up" onClick={() => window.scrollBy({ top: -320, behavior: "smooth" })}>↑</button>
+        <button type="button" aria-label="Scroll ledger down" title="Scroll down" onClick={() => window.scrollBy({ top: 320, behavior: "smooth" })}>↓</button>
+        <button type="button" aria-label="Scroll ledger left" title="Scroll left" onClick={() => scrollHorizontally(-1)}>←</button>
+        <button type="button" aria-label="Scroll ledger right" title="Scroll right" onClick={() => scrollHorizontally(1)}>→</button>
+      </div>
+    </aside>
   );
 }
 

@@ -61,6 +61,14 @@ h1, h2 { font-family: Manrope, sans-serif; }
 .ledger-avatar { width: 31px; height: 31px; flex: 0 0 31px; display: grid; place-items: center; border-radius: 9px; color: var(--orange-dark); background: var(--orange-soft); font-size: 12px; font-weight: 700; }
 .ledger-arrow { color: #b6aaa2; font-size: 20px; }
 .ledger-detail { overflow: hidden; }
+.ledger-floating-nav { position: fixed; z-index: 20; right: 24px; bottom: 24px; width: 150px; padding: 9px; border: 1px solid var(--line); border-radius: 12px; background: #fff; box-shadow: 0 8px 28px #39231624; touch-action: none; }
+.ledger-floating-nav.is-positioned { right: auto; bottom: auto; }
+.ledger-nav-drag { width: 100%; padding: 4px 6px 8px; border: 0; border-bottom: 1px solid var(--line); color: var(--muted); background: transparent; text-align: center; font-size: 10px; cursor: grab; touch-action: none; }
+.ledger-nav-drag:active { cursor: grabbing; }
+.ledger-nav-drag span { margin-right: 4px; color: var(--orange-dark); font-size: 15px; vertical-align: -1px; }
+.ledger-nav-directions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; padding-top: 8px; }
+.ledger-nav-directions button { min-height: 34px; border: 1px solid var(--line); border-radius: 7px; color: var(--orange-dark); background: #fff8f2; font-size: 16px; }
+.ledger-nav-directions button:hover { background: var(--orange-soft); }
 .ledger-detail-heading { align-items: center; }
 .ledger-detail-heading h2 { margin: 0; font-size: 19px; }
 .ledger-detail-heading .eyebrow { margin-bottom: 6px; }
